@@ -461,3 +461,235 @@ class AddAuxiliaryLoss(torch.autograd.Function):
             grad_loss = torch.ones(1, dtype=ctx.dtype, device=grad_output.device)
         return grad_output, grad_loss
 
+
+class MoeMLP(nn.Module):
+    def __init__(self, hidden_size, intermediate_size, pretraining_tp=2):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = nn.SiLU()
+        self.pretraining_tp = pretraining_tp
+
+    def forward(self, x):
+        if self.pretraining_tp > 1:
+            slice = self.intermediate_size // self.pretraining_tp
+            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
+            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
+            # print(self.up_proj.weight.size(), self.down_proj.weight.size())
+            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
+
+            gate_proj = torch.cat(
+                [F.linear(x, gate_proj_slices[i]) for i in range(self.pretraining_tp)],
+                dim=-1,
+            )
+            up_proj = torch.cat(
+                [F.linear(x, up_proj_slices[i]) for i in range(self.pretraining_tp)],
+                dim=-1,
+            )
+
+            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(
+                slice, dim=-1
+            )
+            down_proj = [
+                F.linear(intermediate_states[i], down_proj_slices[i])
+                for i in range(self.pretraining_tp)
+            ]
+            down_proj = sum(down_proj)
+        else:
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+        return down_proj
+
+
+class SparseMoeBlock(nn.Module):
+    """
+    A mixed expert module containing shared experts.
+    """
+
+    def __init__(
+        self,
+        embed_dim,
+        mlp_ratio=4,
+        num_experts=16,
+        num_experts_per_tok=2,
+        pretraining_tp=2,
+    ):
+        super().__init__()
+        self.num_experts_per_tok = num_experts_per_tok
+        self.experts = nn.ModuleList(
+            [
+                MoeMLP(
+                    hidden_size=embed_dim,
+                    intermediate_size=mlp_ratio * embed_dim,
+                    pretraining_tp=pretraining_tp,
+                )
+                for i in range(num_experts)
+            ]
+        )
+        self.gate = MoEGate(
+            embed_dim=embed_dim,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+        )
+        self.n_shared_experts = 2
+
+        if self.n_shared_experts is not None:
+            intermediate_size = embed_dim * self.n_shared_experts
+            self.shared_experts = MoeMLP(
+                hidden_size=embed_dim,
+                intermediate_size=intermediate_size,
+                pretraining_tp=pretraining_tp,
+            )
+
+    def forward(self, hidden_states):
+        identity = hidden_states
+        orig_shape = hidden_states.shape
+        topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
+        # print(topk_idx.tolist(), print(len(topk_idx.tolist())))
+        # global selected_ids_list
+        # selected_ids_list.append(topk_idx.tolist())
+
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        flat_topk_idx = topk_idx.view(-1)
+        if self.training:
+            hidden_states = hidden_states.repeat_interleave(
+                self.num_experts_per_tok, dim=0
+            )
+            y = torch.empty_like(hidden_states, dtype=hidden_states.dtype)
+            for i, expert in enumerate(self.experts):
+                y[flat_topk_idx == i] = expert(
+                    hidden_states[flat_topk_idx == i]
+                ).float()
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.view(*orig_shape)
+            y = AddAuxiliaryLoss.apply(y, aux_loss)
+        else:
+            y = self.moe_infer(
+                hidden_states, flat_topk_idx, topk_weight.view(-1, 1)
+            ).view(*orig_shape)
+        if self.n_shared_experts is not None:
+            y = y + self.shared_experts(identity)
+        return y
+
+    @torch.no_grad()
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        expert_cache = torch.zeros_like(x)
+        idxs = flat_expert_indices.argsort()
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        token_idxs = idxs // self.num_experts_per_tok
+        for i, end_idx in enumerate(tokens_per_expert):
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            expert = self.experts[i]
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            expert_tokens = x[exp_token_idx]
+            expert_out = expert(expert_tokens)
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+
+            # for fp16 and other dtype
+            expert_cache = expert_cache.to(expert_out.dtype)
+            expert_cache.scatter_reduce_(
+                0,
+                exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]),
+                expert_out,
+                reduce="sum",
+            )
+        return expert_cache
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        MambaRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+#################################################################################
+#                              Flash attention Layer.                           #
+#################################################################################
+
+
+class FlashSelfMHAModified(nn.Module):
+    """
+    self-attention with flashattention
+    """
+
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        qkv_bias=True,
+        qk_norm=False,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        device=None,
+        dtype=None,
+        norm_layer=nn.LayerNorm,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        assert self.dim % num_heads == 0, "self.kdim must be divisible by num_heads"
+        self.head_dim = self.dim // num_heads
+        assert (
+            self.head_dim % 8 == 0 and self.head_dim <= 128
+        ), "Only support head_dim <= 128 and divisible by 8, got {}".format(
+            self.head_dim
+        )
+
+        self.Wqkv = nn.Linear(dim, 3 * dim, bias=qkv_bias, **factory_kwargs)
+        # TODO: eps should be 1 / 65530 if using fp16
+        self.q_norm = (
+            norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6)
+            if qk_norm
+            else nn.Identity()
+        )
+        self.k_norm = (
+            norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6)
+            if qk_norm
+            else nn.Identity()
+        )
+        self.inner_attn = FlashSelfAttention(attention_dropout=attn_drop)
+        self.out_proj = nn.Linear(dim, dim, bias=qkv_bias, **factory_kwargs)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(
+        self,
+        x,
+    ):
+        """
+        Parameters
+        ----------
+        x: torch.Tensor
+            (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim)
+        """
+        b, s, d = x.shape
+
+        qkv = self.Wqkv(x)
+        qkv = qkv.view(b, s, 3, self.num_heads, self.head_dim)  # [b, s, 3, h, d]
+        q, k, v = qkv.unbind(dim=2)  # [b, s, h, d]
+        q = self.q_norm(q).half()  # [b, s, h, d]
+        k = self.k_norm(k).half()
+
+        qkv = torch.stack([q, k, v], dim=2)  # [b, s, 3, h, d]
+        context = self.inner_attn(qkv)
+        out = self.out_proj(context.view(b, s, d))
+        out = self.proj_drop(out)
+
+        return out
