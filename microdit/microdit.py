@@ -931,19 +931,19 @@ class PatchMixer(nn.Module):
         return x
 
 class MicroDiT(nn.Module):
-    def __init__(self, in_channels, patch_size, embed_dim, num_layers, num_heads, mlp_dim, caption_embed_dim,
+    def __init__(self, in_channels, patch_size, embed_dim, num_layers, num_heads, mlp_dim,
                  num_experts=4, active_experts=2, dropout=0.1, patch_mixer_layers=2, embed_cat=False):
         super().__init__()
-        
+
         self.patch_size = patch_size
         self.embed_dim = embed_dim
-        
+
         # Image processing
         self.patch_embed = PatchEmbed(in_channels, embed_dim, patch_size)
-        
+
         # Timestep embedding
         self.time_embed = TimestepEmbedder(self.embed_dim)
-        
+
         # Caption embedding
         # self.caption_embed = nn.Sequential(
         #     nn.Linear(caption_embed_dim, self.embed_dim),
@@ -954,14 +954,14 @@ class MicroDiT(nn.Module):
 
         # MHA for timestep and caption
         self.mha = nn.MultiheadAttention(self.embed_dim, num_heads, batch_first=True)
-        
+
         # MLP for timestep and caption
         self.mlp = nn.Sequential(
             nn.Linear(self.embed_dim, self.embed_dim),
             nn.GELU(),
             nn.Linear(self.embed_dim, self.embed_dim)
         )
-        
+
         # Pool + MLP for (MHA + MLP)
         self.pool_mlp = nn.Sequential(
             nn.AdaptiveAvgPool1d(1),
@@ -970,17 +970,17 @@ class MicroDiT(nn.Module):
             nn.GELU(),
             nn.Linear(self.embed_dim, self.embed_dim)
         )
-        
+
         # Linear layer after MHA+MLP
         self.linear = nn.Linear(self.embed_dim, self.embed_dim)
-        
+
         # Patch-mixer
         self.patch_mixer = PatchMixer(self.embed_dim, num_heads, patch_mixer_layers)
-        
+
         # Backbone transformer model
         self.backbone = TransformerBackbone(self.embed_dim, self.embed_dim, self.embed_dim, num_layers, num_heads, mlp_dim, 
                                         num_experts, active_experts, dropout)
-        
+
         # Output layer
         self.output = nn.Sequential(
             nn.Linear(self.embed_dim, self.embed_dim),
@@ -1098,21 +1098,21 @@ class MicroDiT(nn.Module):
         # t: (batch_size, 1)
         # caption_embeddings: (batch_size, caption_embed_dim)
         # mask: (batch_size, num_patches)
-        
+
         batch_size, channels, height, width = x.shape
 
         patch_size_h, patch_size_w = self.patch_size
 
         # Image processing
         x = self.patch_embed(x)  # (batch_size, num_patches, embed_dim)
-        
+
         # Generate positional embeddings
         # (height // patch_size_h, width // patch_size_w, embed_dim)
         pos_embed = get_2d_sincos_pos_embed(self.embed_dim, height // patch_size_h, width // patch_size_w)
         pos_embed = pos_embed.to(x.device).unsqueeze(0).expand(batch_size, -1, -1)
-        
+
         x = x + pos_embed
-        
+
         # Timestep embedding
         t_emb = self.time_embed(t)  # (batch_size, embed_dim)
 
@@ -1121,17 +1121,17 @@ class MicroDiT(nn.Module):
 
         mha_out = self.mha(t_emb.unsqueeze(1), c_emb.unsqueeze(1), c_emb.unsqueeze(1))[0].squeeze(1)
         mlp_out = self.mlp(mha_out)
-        
+
         # Pool + MLP
         pool_out = self.pool_mlp(mlp_out.unsqueeze(2))
 
         # Pool + MLP + t_emb
         pool_out = (pool_out + t_emb).unsqueeze(1)
-        
+
         # Apply linear layer
         cond_signal = self.linear(mlp_out).unsqueeze(1)  # (batch_size, 1, embed_dim)
         cond = (cond_signal + pool_out).expand(-1, x.shape[1], -1)
-        
+
         # Add conditioning signal to all patches
         # (batch_size, num_patches, embed_dim)
         x = x + cond
@@ -1150,7 +1150,7 @@ class MicroDiT(nn.Module):
 
         # Backbone transformer model
         x = self.backbone(x, c_emb)
-        
+
         # Final output layer
         # (bs, unmasked_num_patches, embed_dim) -> (bs, unmasked_num_patches, patch_size_h * patch_size_w * in_channels)
         x = self.output(x)
@@ -1161,16 +1161,16 @@ class MicroDiT(nn.Module):
             x = add_masked_patches(x, mask)
 
         x = unpatchify(x, self.patch_size, height, width)
-        
+
         return x
-    
+
     @torch.no_grad()
     def sample(self, z, cond, sample_steps=50, cfg=2.0):
         b = z.size(0)
         dt = 1.0 / sample_steps
         dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
         images = [z]
-        
+
         for i in range(sample_steps, 0, -1):
             t = i / sample_steps
             t = torch.tensor([t] * b).to(z.device).to(torch.float16)
@@ -1182,5 +1182,47 @@ class MicroDiT(nn.Module):
 
             z = z - dt * vc
             images.append(z)
-            
+
         return (images[-1] / config.vaescale_factor)
+
+
+class RectFlowWrapper:
+    def __init__(self, model, ln=True):
+        self.model = model
+        self.ln = ln
+
+    def forward(self, x, cond):
+        b = x.size(0)
+        if self.ln:
+            nt = torch.randn((b,)).to(x.device)
+            t = torch.sigmoid(nt)
+        else:
+            t = torch.rand((b,)).to(x.device)
+        texp = t.view([b, *([1] * len(x.shape[1:]))])
+        z1 = torch.randn_like(x)
+        zt = (1 - texp) * x + texp * z1
+        vtheta = self.model(zt, t, cond)
+        batchwise_mse = ((z1 - x - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
+        tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
+        ttloss = [(tv, tloss) for tv, tloss in zip(t, tlist)]
+        return batchwise_mse.mean(), ttloss
+
+    @torch.no_grad()
+    def sample(self, z, cond, null_cond=None, sample_steps=50, cfg=2.0):
+        b = z.size(0)
+        dt = 1.0 / sample_steps
+        dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
+        images = [z]
+        for i in range(sample_steps, 0, -1):
+            t = i / sample_steps
+            t = torch.tensor([t] * b).to(z.device)
+
+            vc = self.model(z, t, cond)
+            if null_cond is not None:
+                vu = self.model(z, t, null_cond)
+                vc = vu + cfg * (vc - vu)
+
+            z = z - dt * vc
+            images.append(z)
+
+        return images
