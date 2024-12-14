@@ -14,6 +14,7 @@ from accelerate import Accelerator
 from datasets import load_dataset
 from tqdm import tqdm
 import torchvision
+
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -55,36 +56,66 @@ _encodings["uint8"] = uint8
 remote_train_dir = "./vae_mds"  # this is the path you installed this dataset.
 local_train_dir = "./imagenet"
 
+vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae").to('cuda')
+print("loaded vae")
+
+def vae_decode(latent, vae=vae):
+    # print(f'decoding... (latent shape = {latent.shape}) ')
+    latent = torch.from_numpy(np.array(latent))
+    x = vae.decode(latent).sample
+
+    img = VaeImageProcessor().postprocess(
+        image=x.detach(), do_denormalize=[True, True]
+    )[0]
+
+    return img
+
+
+def process_img(img):
+    img = vae_decode(img[None])
+    return img
+
+
+def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
+    rows, cols = grid_size
+    assert len(pil_images) <= rows * cols, "Grid size must accommodate all images."
+
+    # Create a matplotlib figure
+    fig, axes = plt.subplots(rows, cols, figsize=figsize)
+    axes = axes.flatten()  # Flatten for easy indexing
+
+    for i, ax in enumerate(axes):
+        if i < len(pil_images):
+            # Convert PIL image to NumPy array and plot
+            ax.imshow(np.array(pil_images[i]))
+            ax.axis("off")  # Turn off axis labels
+        else:
+            ax.axis("off")  # Hide empty subplots for unused grid spaces
+
+    plt.tight_layout()
+    plt.savefig(file, bbox_inches="tight")
+    plt.show()
+
+    return file
+
+
 def sample_image_batch(model, step):
+    pred_model = model.eval()
     with torch.no_grad():
-        cond = torch.arange(0, 16).cuda() % 10
+        cond = torch.arange(0, 8).cuda() % 10
         uncond = torch.ones_like(cond) * 10
 
-        init_noise = torch.randn(16, 4, 32, 32).cuda()
-        images = model.sample(init_noise, cond, uncond)
-        # image sequences to gif
-        gif = []
-        for image in images:
-            # unnormalize
-            image = image * 0.5 + 0.5
-            image = image.clamp(0, 1)
-            x_as_image = torchvision.utils.make_grid(image.float(), nrow=4)
-            img = x_as_image.permute(1, 2, 0).cpu().numpy()
-            img = (img * 255).astype(np.uint8)
-            gif.append(pillow.fromarray(img))
-
-        gif[0].save(
-            f"contents/sample_{step}.gif",
-            save_all=True,
-            append_images=gif[1:],
-            duration=100,
-            loop=0,
-        )
-        imgfile = f"sample_{step}.png"
-        last_img = gif[-1]
-        last_img.save(imgfile)
-
+        init_noise = torch.randn(len(cond), 4, 32, 32).cuda()
+        image_batch = pred_model.sample(init_noise, cond, uncond)
+        
+        imgfile = f"samples/sample_{step}.png"
+        batch = [process_img(x) for x in enumerate(image_batch)]
+        gridfile = image_grid(batch, imgfile)
+        
+        del pred_model
+        
         return imgfile
+
 
 
 def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
@@ -97,8 +128,8 @@ def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
     )
 
 
-def train_step(rf_engine, optimizer, data_batch):
-    img_latents, label = data_batch['vae_output'], data_batch['label']
+def train_step(model, optimizer, data_batch):
+    img_latents, label = data_batch['vae_output'].to(torch.bfloat16), data_batch['label']
     img_latents = img_latents.reshape(-1, 4, 32, 32) * config.vaescale_factor
     bs, height, width, channels = img_latents.shape
 
@@ -113,7 +144,7 @@ def train_step(rf_engine, optimizer, data_batch):
     # loss = model(img_latents, label, mask)
     optimizer.zero_grad()
     
-    loss = rf_engine.forward(img_latents, label, mask)
+    loss = model(img_latents, label, mask)
     loss.backward()
     optimizer.step()
 
@@ -164,9 +195,10 @@ def overfit(epochs, model, optimizer, train_loader):
 
 
 @click.command()
-@click.option('-r', '--run_type', default='overfit')
-@click.option('-bs', '--batch_size', default=config.batch_size)
-def main(run_type, batch_size):
+@click.option("-r", "--run_type", default="overfit")
+@click.option("-bs", "--batch_size", default=config.batch_size)
+@click.option("-e", "--epochs", default=10)
+def main(run_type, batch_size, epochs):
 
     dataset = StreamingDataset(
         local=local_train_dir,
@@ -189,7 +221,7 @@ def main(run_type, batch_size):
     )
 
     sp = next(iter(train_loader))
-    
+
     print(f"loaded dataset, sample shape {sp['vae_output'].shape} /  {sp['label'].shape}, type = {type(sp['vae_output'])}")
 
     dit_model = MicroDiT(
@@ -203,7 +235,23 @@ def main(run_type, batch_size):
     )
 
     rf_engine = RectFlowWrapper(dit_model)
-    optimizer = torch.optim.AdamW(dit_model.parameters(), lr=config.lr)
-    accelerator = Accelerator(mixed_precision='bfloat16', gradient_accumulation_steps=2)
 
-    dit_model, optimizer, train_loader = accelerator.prepare(dit_model, optimizer, train_loader)
+    model_size = sum(p.numel() for p in rf_engine.parameters() if p.requires_grad)
+    print(f"Number of parameters: {model_size}, {model_size / 1e6}M")
+
+    optimizer = torch.optim.AdamW(rf_engine.parameters(), lr=config.lr)
+    # accelerator = Accelerator(mixed_precision='bfloat16', gradient_accumulation_steps=2)
+
+    # rf_engine, optimizer, train_loader, vae = accelerator.prepare(rf_engine, optimizer, train_loader, vae)
+
+    if run_type == 'overfit':
+        model, loss = overfit(epochs, rf_engine, optimizer, train_loader)
+        wandb.finish()
+        print(f"microdit overfitting ended at loss {loss:.4f}")
+
+    elif run_type == "train":
+        trainer(epochs, rf_engine, optimizer, train_loader)
+        wandb.finish()
+        print("microdit (test) training (on imagenet-1k) in JAX..done")
+
+main()

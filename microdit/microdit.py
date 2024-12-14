@@ -1230,4 +1230,4 @@ class RectFlowWrapper(nn.Module):
             z_latent = z_latent - dt * vc
             images.append(z_latent)
 
-        return images
+        return images[-1] / config.vaescale_factor
