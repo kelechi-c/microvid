@@ -206,6 +206,74 @@ def add_masked_patches(patches, mask):
     return full_patches
 
 
+class PatchEmbed(nn.Module):
+    def __init__(self, in_channels, embed_dim, patch_size):
+        super().__init__()
+        self.proj = nn.Conv2d(
+            in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
+        )
+        self.patch_size = patch_size
+
+    def forward(self, x):
+        x = self.proj(x)  # (B, C, H, W) -> (B, E, H', W')
+        return x.flatten(2).transpose(1, 2)  # (B, E, H', W') -> (B, H'*W', E)
+
+
+def get_2d_sincos_pos_embed(embed_dim, h, w):
+    
+    grid_h = torch.arange(h, dtype=torch.float32)
+    grid_w = torch.arange(w, dtype=torch.float32)
+    grid = torch.meshgrid(grid_h, grid_w, indexing="ij")
+    grid = torch.stack(grid, dim=0)
+
+    grid = grid.reshape([2, 1, h, w])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    return pos_embed
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    emb = torch.cat([emb_h, emb_w], dim=1)  # (H*W, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+
+    assert embed_dim % 2 == 0
+    omega = torch.arange(embed_dim // 2, dtype=torch.float32)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = torch.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
+
+    emb_sin = torch.sin(out)  # (M, D/2)
+    emb_cos = torch.cos(out)  # (M, D/2)
+
+    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
+    return emb
+
+
+def get_timestep_embedding(timesteps, embedding_dim):
+
+    assert len(timesteps.shape) == 1, "Timesteps should be a 1-D tensor"
+
+    half_dim = embedding_dim // 2
+    emb = torch.log(torch.tensor(10000, dtype=torch.float32)) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = emb.to(device=timesteps.device)
+    emb = timesteps.float()[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:  # zero pad
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+    return emb
+
+
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
@@ -554,82 +622,6 @@ class RMSNorm(nn.Module):
 
 
 #################################################################################
-#                              Flash attention Layer.                           #
-#################################################################################
-
-
-class FlashSelfMHAModified(nn.Module):
-    """
-    self-attention with flashattention
-    """
-
-    def __init__(
-        self,
-        dim,
-        num_heads,
-        qkv_bias=True,
-        qk_norm=False,
-        attn_drop=0.0,
-        proj_drop=0.0,
-        device=None,
-        dtype=None,
-        norm_layer=nn.LayerNorm,
-    ):
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        assert self.dim % num_heads == 0, "self.kdim must be divisible by num_heads"
-        self.head_dim = self.dim // num_heads
-        assert (
-            self.head_dim % 8 == 0 and self.head_dim <= 128
-        ), "Only support head_dim <= 128 and divisible by 8, got {}".format(
-            self.head_dim
-        )
-
-        self.Wqkv = nn.Linear(dim, 3 * dim, bias=qkv_bias, **factory_kwargs)
-        # TODO: eps should be 1 / 65530 if using fp16
-        self.q_norm = (
-            norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6)
-            if qk_norm
-            else nn.Identity()
-        )
-        self.k_norm = (
-            norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6)
-            if qk_norm
-            else nn.Identity()
-        )
-        self.inner_attn = FlashSelfAttention(attention_dropout=attn_drop)
-        self.out_proj = nn.Linear(dim, dim, bias=qkv_bias, **factory_kwargs)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(
-        self,
-        x,
-    ):
-        """
-        Parameters
-        ----------
-        x: torch.Tensor
-            (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim)
-        """
-        b, s, d = x.shape
-
-        qkv = self.Wqkv(x)
-        qkv = qkv.view(b, s, 3, self.num_heads, self.head_dim)  # [b, s, 3, h, d]
-        q, k, v = qkv.unbind(dim=2)  # [b, s, h, d]
-        q = self.q_norm(q).half()  # [b, s, h, d]
-        k = self.k_norm(k).half()
-
-        qkv = torch.stack([q, k, v], dim=2)  # [b, s, 3, h, d]
-        context = self.inner_attn(qkv)
-        out = self.out_proj(context.view(b, s, d))
-        out = self.proj_drop(out)
-
-        return out
-
-
-#################################################################################
 #                                 Core DiT Model                                #
 #################################################################################
 
@@ -652,14 +644,9 @@ class DiTBlock(nn.Module):
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        if use_flash_attn:
-            self.attn = FlashSelfMHAModified(
-                hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True
-            )
-        else:
-            self.attn = Attention(
-                hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs
-            )
+        self.attn = Attention(
+            hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs
+        )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # mlp_hidden_dim = int(hidden_size * mlp_ratio)
         # approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -735,282 +722,6 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
-
-class DiT(nn.Module):
-    """
-    Diffusion model with a Transformer backbone.
-    """
-
-    def __init__(
-        self,
-        input_size=32,
-        patch_size=2,
-        in_channels=4,
-        hidden_size=1152,
-        depth=28,
-        num_heads=16,
-        mlp_ratio=4,
-        class_dropout_prob=0.1,
-        num_classes=1000,
-        num_experts=8,
-        num_experts_per_tok=2,
-        pretraining_tp=2,
-        learn_sigma=True,
-        use_flash_attn=False,
-    ):
-        super().__init__()
-        self.learn_sigma = learn_sigma
-        self.in_channels = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
-        self.patch_size = patch_size
-        self.num_heads = num_heads
-
-        self.x_embedder = PatchEmbed(
-            input_size, patch_size, in_channels, hidden_size, bias=True
-        )
-        self.t_embedder = TimestepEmbedder(hidden_size)
-        # self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        num_patches = self.x_embedder.num_patches
-        # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches, hidden_size), requires_grad=False
-        )
-
-        self.blocks = nn.ModuleList(
-            [
-                DiTBlock(
-                    hidden_size,
-                    num_heads,
-                    mlp_ratio,
-                    num_experts,
-                    num_experts_per_tok,
-                    pretraining_tp,
-                    use_flash_attn,
-                )
-                for _ in range(depth)
-            ]
-        )
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        # Initialize transformer layers:
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-
-        self.apply(_basic_init)
-
-        # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1], int(self.x_embedder.num_patches**0.5)
-        )
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
-
-        # Initialize label embedding table:
-        # nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
-
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def unpatchify(self, x):
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
-        """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum("nhwpqc->nchpwq", x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
-
-    def forward(self, x, t, y):
-        """
-        Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        # y: (N,) tensor of class labels
-        y: (N, D) tensor of class embeddings
-        """
-        # x = x.half()
-        # t = t.half()
-        x = (
-            self.x_embedder(x) + self.pos_embed
-        )  # (N, T, D), where T = H * W / patch_size ** 2
-        t = self.t_embedder(t)  # (N, D)
-        # y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y  # (N, D)
-        for block in self.blocks:
-            x = block(x, c)  # (N, T, D)
-        x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)  # (N, out_channels, H, W)
-        return x
-
-    def forward_with_cfg(self, x, t, y, cfg_scale):
-        """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
-
-
-#################################################################################
-#                   Sine/Cosine Positional Embedding Functions                  #
-#################################################################################
-# https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
-
-
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = np.stack(grid, axis=0)
-
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate(
-            [np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0
-        )
-    return pos_embed
-
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
-    return emb
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
-
-    emb_sin = np.sin(out)  # (M, D/2)
-    emb_cos = np.cos(out)  # (M, D/2)
-
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb
-
-
-#################################################################################
-#                                   DiT Configs                                  #
-#################################################################################
-
-
-def DiT_G_2(**kwargs):
-    return DiT(depth=40, hidden_size=1408, patch_size=2, num_heads=16, **kwargs)
-
-
-def DiT_XL_2(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
-
-
-def DiT_XL_4(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
-
-
-def DiT_XL_8(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
-
-
-def DiT_L_2(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
-
-
-def DiT_L_4(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
-
-
-def DiT_L_8(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
-
-
-def DiT_B_2(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
-
-
-def DiT_B_4(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
-
-
-def DiT_B_8(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
-
-
-def DiT_S_2(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
-
-
-def DiT_S_4(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
-
-
-def DiT_S_8(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
-
-
-def nearest_divisor(scaled_num_heads, embed_dim):
-    # Find all divisors of embed_dim
-    divisors = [i for i in range(1, embed_dim + 1) if embed_dim % i == 0]
-
-    # Find the nearest divisor
-    nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
-
-    return nearest
 
 
 class TransformerBackbone(nn.Module):
@@ -1177,36 +888,7 @@ class PatchMixer(nn.Module):
         return x
 
 class MicroDiT(nn.Module):
-    """
-    MicroDiT is a image diffusion transformer model.
-
-    Args:
-        in_channels (int): Number of input channels in the image data.
-        patch_size (tuple of int): Size of the patches to be extracted from the image.
-        embed_dim (int): Dimension of the embedding space.
-        num_layers (int): Number of layers in the transformer backbone.
-        num_heads (int): Number of attention heads in the multi-head attention mechanism.
-        mlp_dim (int): Dimension of the multi-layer perceptron.
-        class_label_dim (int): Dimension of the class labels.
-        num_experts (int, optional): Number of experts in the transformer backbone. Default is 4.
-        active_experts (int, optional): Number of active experts in the transformer backbone. Default is 2.
-        dropout (float, optional): Dropout rate. Default is 0.1.
-        patch_mixer_layers (int, optional): Number of layers in the patch mixer. Default is 2.
-        embed_cat (bool, optional): Whether to concatenate embeddings. Default is False. If true, the timestep, class, and positional embeddings are concatenated rather than summed.
-
-    Attributes:
-        patch_size (tuple of int): Size of the patches to be extracted from the image.
-        embed_dim (int): Dimension of the embedding space.
-        patch_embed (PatchEmbed): Patch embedding layer.
-        time_embed (TimestepEmbedder): Timestep embedding layer.
-        class_embed (nn.Sequential): Class embedding layer.
-        mha (nn.MultiheadAttention): Multi-head attention mechanism.
-        mlp (nn.Sequential): Multi-layer perceptron for processing embeddings.
-        pool_mlp (nn.Sequential): Pooling and multi-layer perceptron for (MHA + MLP).
-        linear (nn.Linear): Linear layer after MHA+MLP.
-        patch_mixer (PatchMixer): Patch mixer layer.
-        backbone (TransformerBackbone): Transformer backbone model.
-    """
+    
     def __init__(self, in_channels, patch_size, embed_dim, num_layers, num_heads, mlp_dim, caption_embed_dim,
                  num_experts=4, active_experts=2, dropout=0.1, patch_mixer_layers=2, embed_cat=False):
         super().__init__()
@@ -1461,7 +1143,7 @@ class MicroDiT(nn.Module):
 
 class ShapeBatchingDataset(IterableDataset):
     def __init__(self, batch_size=9, shuffle=True, seed=42, buffer_multiplier=20):
-        self.split_size = 1000
+        self.split_size = 10000
         self.dataset = load_dataset('SwayStar123/preprocessed_commoncatalog-cc-by', streaming=True, split="train", trust_remote_code=True).take(self.split_size)
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -1504,11 +1186,8 @@ class ShapeBatchingDataset(IterableDataset):
     
     def __len__(self):
         return len(self.dataset) // self.batch_size
-    
 
 
-   
-    
 # dataset = Text2ImageDataset()
 spd = ShapeBatchingDataset()
 t2i_train_loader = DataLoader(spd, batch_size=9)
@@ -1552,11 +1231,17 @@ def sample(model, z, cond, null_cond=None, sample_steps=50, cfg=2.0):
 # Comment this out if you havent downloaded dataset and models yet
 datasets.config.HF_HUB_OFFLINE = 1
 
+DIT_B = dict(
+    num_layers=12,
+    num_heads=12,
+    embed_dim=768,
+)
+
 input_dim = VAE_CHANNELS  # 4 channels in latent space
 patch_size = (2, 2)
-embed_dim = DIT["embed_dim"]
-num_layers = DIT["num_layers"]
-num_heads = DIT["num_heads"]
+embed_dim = DIT_B["embed_dim"]
+num_layers = DIT_B["num_layers"]
+num_heads = DIT_B["num_heads"]
 mlp_dim = embed_dim * 4
 caption_embed_dim = 1152  # SigLip embeds to 1152 dims
 # pos_embed_dim = 60
@@ -1612,9 +1297,9 @@ if accelerator.is_main_process:
             f.write(f"{index}: {caption}\n")
 
     losses = []
-    
+
 batch = next(iter(dataset))
-    
+
 
 epochs = 2000
 
@@ -1662,6 +1347,6 @@ def batch_trainer(epochs = epochs):
 
 
     print("overfit complete.")
-    
+
 
 batch_trainer()
