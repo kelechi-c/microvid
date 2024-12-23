@@ -241,3 +241,48 @@ def add_masked_patches(patches, mask):
     full_patches[mask_indices[0], mask_indices[1]] = patches
 
     return full_patches
+
+
+class Patchify(nn.Module):
+    def __init__( 
+        self,
+        patch_size: int = 16,
+        in_chans: int = 3,
+        embed_dim: int = 768,
+        norm_layer = None,
+        flatten: bool = True,
+        bias: bool = True,
+        dynamic_img_pad: bool = False,
+    ):
+        super().__init__()
+        self.patch_size = to_2tuple(patch_size)
+        self.flatten = flatten
+        self.dynamic_img_pad = dynamic_img_pad
+
+        self.conv_proj = nn.Conv2d(
+            in_chans,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=bias,
+        )
+
+        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+
+    def forward(self, x):
+        B, _C, T, H, W = x.shape
+
+        pad_h = (self.patch_size[0] - H % self.patch_size[0]) % self.patch_size[0]
+        pad_w = (self.patch_size[1] - W % self.patch_size[1]) % self.patch_size[1]
+        x = F.pad(x, (0, pad_w, 0, pad_h))
+
+        x = rearrange(x, "B C T H W -> (B T) C H W", B=B, T=T)
+        x = self.conv_proj(x)
+
+        # Flatten temporal and spatial dimensions.
+        if not self.flatten:
+            raise NotImplementedError("Must flatten output.")
+        x = rearrange(x, "(B T) C H W -> B (T H W) C", B=B, T=T)
+
+        x = self.norm(x)
+        return x
