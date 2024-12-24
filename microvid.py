@@ -15,11 +15,7 @@ import torch.nn.functional as F
 import collections.abc
 import math
 from itertools import repeat
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
+from typing import Callable, Optional
 
 
 # From PyTorch internals
@@ -61,17 +57,6 @@ def modulate(x, shift, scale):
 
 
 def apply_mask_to_tensor(x, mask, patch_size):
-    """
-    Applies a mask to a tensor. Turns the masked values to 0s.
-
-    Args:
-        x (torch.Tensor): Tensor of shape (bs, c, d, h, w)
-        mask (torch.Tensor): Tensor of shape (bs, num_patches)
-        patch_size (int): Size of each patch.
-
-    Returns:
-        torch.Tensor: Tensor of shape (bs, c, h, w) with the masked values turned to 0s.
-    """
     bs, c, d, h, w = x.shape
     num_patches_d = d // patch_size[0]
     num_patches_h = h // patch_size[1]
@@ -102,19 +87,7 @@ def apply_mask_to_tensor(x, mask, patch_size):
 
 
 def unpatchify(x, patch_size, depth, height, width):
-    """
-    Reconstructs videos from patches without using F.fold.
 
-    Args:
-        x (torch.Tensor): Tensor of shape (bs, num_patches, D * H * W * in_channels)
-        patch_size (tuple of int): Size of each patch as (D, H, W).
-        depth (int): Original video depth (number of frames).
-        height (int): Original video height.
-        width (int): Original video width.
-
-    Returns:
-        torch.Tensor: Reconstructed video of shape (bs, in_channels, depth, height, width)
-    """
     bs, num_patches, patch_dim = x.shape
     D, H, W = patch_size
     in_channels = patch_dim // (D * H * W)
@@ -145,16 +118,7 @@ def unpatchify(x, patch_size, depth, height, width):
 
 
 def strings_to_tensor(string_list):
-    """
-    Converts a list of strings, each representing a list (e.g., "[1, 2, 3]"),
-    into a PyTorch tensor.
-
-    Args:
-        string_list (list of str): A list of strings, where each string is a list in string form.
-
-    Returns:
-        torch.Tensor: A PyTorch tensor containing the data from the lists.
-    """
+    
     # Convert each string to a list using eval
     list_of_lists = [eval(s) for s in string_list]
 
@@ -167,20 +131,7 @@ def strings_to_tensor(string_list):
 def random_mask(
     bs: int, depth: int, height: int, width: int, patch_size: tuple, mask_ratio: float
 ) -> torch.Tensor:
-    """
-    Generates a random mask for patched videos. Randomly selects patches across depth, height, and width to mask.
-
-    Args:
-        bs (int): Batch size.
-        depth (int): Depth of the video (number of frames).
-        height (int): Height of the video.
-        width (int): Width of the video.
-        patch_size (tuple of int): Size of the patches as (D, H, W).
-        mask_ratio (float): Ratio of patches to mask. Ranges from 0 to 1.
-
-    Returns:
-        mask (torch.Tensor): A tensor of shape (bs, num_patches) with values in {0, 1}.
-    """
+    
     D, H, W = patch_size
     num_patches_d = depth // D
     num_patches_h = height // H
@@ -246,7 +197,7 @@ def add_masked_patches(patches, mask):
 class Patchify(nn.Module):
     def __init__( 
         self,
-        patch_size: int = 16,
+        patch_size: int = 2,
         in_chans: int = 3,
         embed_dim: int = 768,
         norm_layer = None,
@@ -269,7 +220,7 @@ class Patchify(nn.Module):
 
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         B, _C, T, H, W = x.shape
 
         pad_h = (self.patch_size[0] - H % self.patch_size[0]) % self.patch_size[0]
@@ -280,9 +231,97 @@ class Patchify(nn.Module):
         x = self.conv_proj(x)
 
         # Flatten temporal and spatial dimensions.
-        if not self.flatten:
-            raise NotImplementedError("Must flatten output.")
         x = rearrange(x, "(B T) C H W -> B (T H W) C", B=B, T=T)
 
         x = self.norm(x)
+        return x
+
+
+class TimestepEmbedder(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        frequency_embedding_size: int = 256,
+        *,
+        bias: bool = True,
+        timestep_scale: Optional[float] = None,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=bias, device=device),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=bias, device=device),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+        self.timestep_scale = timestep_scale
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        half = dim // 2
+        freqs = torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
+        freqs.mul_(-math.log(max_period) / half).exp_()
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
+        return embedding
+
+    def forward(self, t):
+        if self.timestep_scale is not None:
+            t = t * self.timestep_scale
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
+class PooledCaptionEmbedder(nn.Module):
+    def __init__(
+        self,
+        caption_feature_dim: int,
+        hidden_size: int,
+        *,
+        bias: bool = True,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        self.caption_feature_dim = caption_feature_dim
+        self.hidden_size = hidden_size
+        self.mlp = nn.Sequential(
+            nn.Linear(caption_feature_dim, hidden_size, bias=bias, device=device),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=bias, device=device),
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_size: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        # keep parameter count and computation constant compared to standard FFN
+        hidden_size = int(2 * hidden_size / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_size = int(ffn_dim_multiplier * hidden_size)
+        hidden_size = multiple_of * ((hidden_size + multiple_of - 1) // multiple_of)
+
+        self.hidden_dim = hidden_size
+        self.w1 = nn.Linear(in_features, 2 * hidden_size, bias=False, device=device)
+        self.w2 = nn.Linear(hidden_size, in_features, bias=False, device=device)
+
+    def forward(self, x: torch.Tensor):
+        # torch.chun
+        x, gate = self.w1(x).chunk(2, dim=-1)
+        x = self.w2(F.silu(x) * gate)
         return x
