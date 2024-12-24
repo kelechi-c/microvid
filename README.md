@@ -1,3 +1,3 @@
-## tiny_vidit/ekko
-A tiny image/video gen model with a microdit backbone.
+## microvid
+A tiny **video generation** model with a [**microdiffusion**](https://arxiv.org/abs/2407.15811) backbone.
 Also contains minimal implementation for MicroDiT training.
