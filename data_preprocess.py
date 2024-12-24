@@ -2,25 +2,84 @@
 # ! pip install git+https://github.com/huggingface/diffusers
 
 import torch
-import cv2
-import os
-import yt_dlp
+import cv2, os, gc, click
 import numpy as np
 from pathlib import Path
 from torchvision import transforms
 from typing import Tuple
 from datasets import load_dataset
-from diffusers.models.autoencoders.autoencoder_kl_mochi import AutoencoderKLMochi
+from diffusers import AutoencoderKLLTXVideo
+from huggingface_hub import login
+
+login("")
 
 vae_id = "genmo/mochi-1-preview"
-data_id = "Doubiiu/webvid10m_motion"
+source_data_id = "Doubiiu/webvid10m_motion"
+smol_data = "tensorkelechi/tinyvirat"
+latents_id = "tensorkelechi/tiny_webvid_latents"
+split_size = 100
 
-mochi_vae = AutoencoderKLMochi.from_pretrained(
-    vae_id, subfolder="vae", torch_dtype=torch.float32
-)  # .to("cuda")
-mochi_vae.enable_tiling()
+ltx_vae = AutoencoderKLLTXVideo.from_pretrained(
+    "Lightricks/LTX-Video", subfolder="vae", torch_dtype=torch.float32
+).to("cuda")
 
-vid_data = load_dataset(data_id, split="train").take(10000)
+vid_data = load_dataset(source_data_id, split="train").take(split_size)
+
+
+## preprocessing video, from url to tensors
+transform_list = [transforms.ToTensor()]
+transform_list.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+transform = transforms.Compose(transform_list)
+
+
+def vid2tensor(
+    batch,
+    target_fps: int = 4,
+    target_duration: int = 5,
+    target_size: Tuple[int, int] = (224, 224),
+) -> torch.Tensor:
+
+    # if isinstance(video_path, str):
+    video_path = Path(batch["video"])
+
+    # Read video
+    frames = []
+    cap = cv2.VideoCapture(str(video_path))
+
+    target_frames = target_fps * target_duration
+
+    while len(frames) < target_frames:
+        ret, frame = cap.read()
+        if not ret:
+            # If video is shorter, loop from beginning
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+        # Resize frame
+        frame = cv2.resize(frame, target_size)
+
+        # Convert BGR to RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Apply transforms
+        frame_tensor = transform(frame)
+        frames.append(frame_tensor)
+
+    cap.release()
+
+    if not frames:
+        raise ValueError(f"No frames could be read from video: {video_path}")
+
+    # Stack frames
+    video_tensor = torch.stack(frames)
+
+    # Rearrange from (T, C, H, W) to (C, T, H, W)
+    batch["video_tensor"] = video_tensor.permute(1, 0, 2, 3).detach().numpy()
+    batch["shape"] = batch["video_tensor"].shape
+
+    return batch
 
 
 class VideoProcessor:
@@ -104,85 +163,36 @@ class VideoProcessor:
         return output_path if frames_written > 0 else None
 
     def process_video_dataset(self, batch):
-        
         # Download video
         raw_path = self.download_video(batch)
+        
         # Process video
         batch["video"] = str(self.process_video(raw_path, batch))
-
+        gc.collect()
+        
+        batch = vid2tensor(batch)
+        
         return batch
 
 
 processor = VideoProcessor(
-    output_dir="videos", target_size=(224, 224), target_fps=4, target_duration=5
+    output_dir="video_dataset", target_size=(256, 256), target_fps=4, target_duration=5
 )
-
-
-transform_list = [transforms.ToTensor()]
-transform_list.append(
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-)
-
-transform = transforms.Compose(transform_list)
-
-
-def vid2tensor(
-    batch,
-    target_fps: int = 4,
-    target_duration: int = 5,
-    target_size: Tuple[int, int] = (224, 224),
-) -> torch.Tensor:
-
-    # if isinstance(video_path, str):
-    video_path = Path(batch["video"])
-
-    # Read video
-    frames = []
-    cap = cv2.VideoCapture(str(video_path))
-
-    target_frames = target_fps * target_duration
-
-    while len(frames) < target_frames:
-        ret, frame = cap.read()
-        if not ret:
-            # If video is shorter, loop from beginning
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-        # Resize frame
-        frame = cv2.resize(frame, target_size)
-
-        # Convert BGR to RGB
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Apply transforms
-        frame_tensor = transform(frame)
-        frames.append(frame_tensor)
-
-    cap.release()
-
-    if not frames:
-        raise ValueError(f"No frames could be read from video: {video_path}")
-
-    # Stack frames
-    video_tensor = torch.stack(frames)
-
-    # Rearrange from (T, C, H, W) to (C, T, H, W)
-    batch["video_tensor"] = video_tensor.permute(1, 0, 2, 3).detach().numpy()
-    batch["shape"] = batch["video_tensor"].shape
-
-    return batch
 
 
 def encode_video(batch):
-    batch["video_latents"] = mochi_vae.encode(
-        torch.tensor(batch["video_tensor"])[None]
-    )[0]
+    latents = ltx_vae.encode(torch.tensor(batch["video_tensor"])[None].cuda())[0]
+    batch["video_latents"] = latents.sample()
+    batch["shape"] = batch["video_latents"].shape
+    torch.cuda.empty_cache()
+    gc.collect()
+
     return batch
 
-
 vid_data = vid_data.map(processor.process_video_dataset)
-vid_data = vid_data.map(vid2tensor)
-latent_data_pp = vid_data.map(encode_video).remove_columns("video_tensor")
+vid_data.push_to_hub(smol_data)
+print(f'finished downloading and processing {split_size} videos from {source_data_id}')
+
+latent_data = vid_data.map(encode_video).remove_columns("video_tensor")
+latent_data.push_to_hub(latents_id)
+print(f'dataset preprocessing and latent encoding complete! pushed to {latents_id}')
