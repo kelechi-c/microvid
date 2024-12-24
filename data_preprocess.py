@@ -1,6 +1,3 @@
-# ! pip install yt-dlp datasets accelerate opencv-python
-# ! pip install git+https://github.com/huggingface/diffusers
-
 import torch
 import cv2, os, gc, click
 import numpy as np
@@ -17,18 +14,27 @@ vae_id = "genmo/mochi-1-preview"
 source_data_id = "Doubiiu/webvid10m_motion"
 smol_data = "tensorkelechi/tinyvirat"
 latents_id = "tensorkelechi/tiny_webvid_latents"
-split_size = 100
+split_size = 1024
 
 ltx_vae = AutoencoderKLLTXVideo.from_pretrained(
-    "Lightricks/LTX-Video", subfolder="vae", torch_dtype=torch.float32
+    "Lightricks/LTX-Video", subfolder="vae", torch_dtype=torch.bfloat16
 ).to("cuda")
+ltx_vae.enable_tiling()
+ltx_vae.eval()
 
-vid_data = load_dataset(source_data_id, split="train").take(split_size)
+vid_data = (
+    load_dataset(source_data_id, split="train")
+    .filter(lambda x: x["dynamic_source_category"] != "none")
+    .take(split_size)
+)
 
+print("loaded dataset and video VAE")
 
 ## preprocessing video, from url to tensors
 transform_list = [transforms.ToTensor()]
-transform_list.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+transform_list.append(
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+)
 transform = transforms.Compose(transform_list)
 
 
@@ -78,6 +84,8 @@ def vid2tensor(
     # Rearrange from (T, C, H, W) to (C, T, H, W)
     batch["video_tensor"] = video_tensor.permute(1, 0, 2, 3).detach().numpy()
     batch["shape"] = batch["video_tensor"].shape
+    torch.cuda.empty_cache()
+    gc.collect()
 
     return batch
 
@@ -165,13 +173,13 @@ class VideoProcessor:
     def process_video_dataset(self, batch):
         # Download video
         raw_path = self.download_video(batch)
-        
+
         # Process video
         batch["video"] = str(self.process_video(raw_path, batch))
         gc.collect()
-        
+
         batch = vid2tensor(batch)
-        
+
         return batch
 
 
@@ -181,18 +189,36 @@ processor = VideoProcessor(
 
 
 def encode_video(batch):
-    latents = ltx_vae.encode(torch.tensor(batch["video_tensor"])[None].cuda())[0]
-    batch["video_latents"] = latents.sample()
-    batch["shape"] = batch["video_latents"].shape
-    torch.cuda.empty_cache()
-    gc.collect()
+    with torch.no_grad():
+        video_tensor = (
+            torch.tensor(batch["video_tensor"])[None].cuda().to(torch.bfloat16)
+        )
+        latents = ltx_vae.tiled_encode(video_tensor)[0]
+        batch["video_latents"] = latents  # .sample()
+        batch["latent_shape"] = batch["video_latents"].shape
+        del latents
+        torch.cuda.empty_cache()
+        gc.collect()
 
     return batch
 
-vid_data = vid_data.map(processor.process_video_dataset)
-vid_data.push_to_hub(smol_data)
-print(f'finished downloading and processing {split_size} videos from {source_data_id}')
 
-latent_data = vid_data.map(encode_video).remove_columns("video_tensor")
+print(f"start processing/downloads..")
+vid_data = vid_data.map(
+    processor.process_video_dataset, writer_batch_size=256
+).remove_columns(
+    [
+        "videoid",
+        "video",
+        "duration",
+        "page_dir",
+        "dynamic_confidence",
+        "dynamic_wording",
+    ]
+)
+vid_data.push_to_hub(smol_data)
+print(f"finished downloading and processing {split_size} videos from {source_data_id}")
+
+latent_data = vid_data.map(encode_video).remove_columns(["video_tensor", "shape"])
 latent_data.push_to_hub(latents_id)
-print(f'dataset preprocessing and latent encoding complete! pushed to {latents_id}')
+print(f"dataset preprocessing and latent encoding complete! pushed to {latents_id}")
