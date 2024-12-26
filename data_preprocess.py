@@ -5,11 +5,13 @@ from pathlib import Path
 from torchvision import transforms
 from typing import Tuple
 from datasets import load_dataset
+from transformers import AutoTokenizer, T5EncoderModel
 from diffusers import AutoencoderKLLTXVideo
 from huggingface_hub import login
 
 login("")
 
+t5_id = "google-t5/t5-base"
 vae_id = "genmo/mochi-1-preview"
 source_data_id = "Doubiiu/webvid10m_motion"
 smol_data = "tensorkelechi/tinyvirat"
@@ -21,6 +23,11 @@ ltx_vae = AutoencoderKLLTXVideo.from_pretrained(
 ).to("cuda")
 ltx_vae.enable_tiling()
 ltx_vae.eval()
+
+t5_tokenizer = AutoTokenizer.from_pretrained(t5_id)  # .to('cuda')
+t5_model = T5EncoderModel.from_pretrained(t5_id).to("cuda")
+print("loaded text encoder from google-t5/t5-base")
+
 
 vid_data = (
     load_dataset(source_data_id, split="train")
@@ -203,6 +210,14 @@ def encode_video(batch):
     return batch
 
 
+def text_t5_encode(batch, tokenizer=t5_tokenizer, model=t5_model):
+    input_ids = tokenizer(batch['name'], return_tensors="pt").input_ids  # Batch size 1
+    outputs = model(input_ids=input_ids.cuda())
+    batch['text_encoded'] = outputs.last_hidden_state
+
+    return batch
+
+
 print(f"start processing/downloads..")
 vid_data = vid_data.map(
     processor.process_video_dataset, writer_batch_size=256
@@ -219,6 +234,10 @@ vid_data = vid_data.map(
 vid_data.push_to_hub(smol_data)
 print(f"finished downloading and processing {split_size} videos from {source_data_id}")
 
-latent_data = vid_data.map(encode_video).remove_columns(["video_tensor", "shape"])
+vid_data = vid_data.map(text_t5_encode)
+print(f'captions encoded with text encoder {t5_id}')
+latent_data = vid_data.map(encode_video, writer_batch_size=256).remove_columns(
+    ["video_tensor", "shape", "contentUrl"]
+)
 latent_data.push_to_hub(latents_id)
 print(f"dataset preprocessing and latent encoding complete! pushed to {latents_id}")
