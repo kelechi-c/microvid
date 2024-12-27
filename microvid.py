@@ -135,7 +135,6 @@ def unpatchify(x, patch_size, depth, height, width):
 
 
 def strings_to_tensor(string_list):
-    
     # Convert each string to a list using eval
     list_of_lists = [eval(s) for s in string_list]
 
@@ -336,6 +335,268 @@ class FeedForward(nn.Module):
         x, gate = self.w1(x).chunk(2, dim=-1)
         x = self.w2(F.silu(x) * gate)
         return x
+    
+
+class DiTBlock(nn.Module):
+    """
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    """
+
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        mlp_ratio=4,
+        num_experts=8,
+        num_experts_per_tok=2,
+        pretraining_tp=2,
+        use_flash_attn=False,
+        **block_kwargs,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(
+            hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs
+        )
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        # mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        # approx_gelu = lambda: nn.GELU(approximate="tanh")
+        # self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.moe = SparseMoeBlock(
+            hidden_size, mlp_ratio, num_experts, num_experts_per_tok, pretraining_tp
+        )
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.MultiheadAttention):
+                nn.init.xavier_uniform_(module.in_proj_weight)
+                if module.in_proj_bias is not None:
+                    nn.init.constant_(module.in_proj_bias, 0)
+                nn.init.xavier_uniform_(module.out_proj.weight)
+                if module.out_proj.bias is not None:
+                    nn.init.constant_(module.out_proj.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                if module.weight is not None:
+                    nn.init.constant_(module.weight, 1.0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+        # Apply basic initialization to all modules
+        self.apply(_basic_init)
+
+        # Zero-out the last layer of adaLN modulation if it exists
+        if hasattr(self, "adaLN_modulation"):
+            if self.adaLN_modulation[-1].weight is not None:
+                nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+            if self.adaLN_modulation[-1].bias is not None:
+                nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=1)
+        )
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa)
+        )
+        x = x + gate_mlp.unsqueeze(1) * self.moe(
+            modulate(self.norm2(x), shift_mlp, scale_mlp)
+        )
+        return x
+
+
+class FinalLayer(nn.Module):
+    """
+    The final layer of DiT.
+    """
+
+    def __init__(self, hidden_size, patch_size, out_channels):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(
+            hidden_size, patch_size * patch_size * out_channels, bias=True
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+
+
+class TransformerBackbone(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        embed_dim: int,
+        class_embed_dim: int,
+        num_layers: int,
+        num_heads: int,
+        mlp_dim: int,
+        num_experts: int = 4,
+        active_experts: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_embedding = nn.Linear(input_dim, embed_dim)
+        self.class_embedding = nn.Linear(class_embed_dim, embed_dim)
+
+        # Define scaling ranges for m_f and m_a
+        mf_min, mf_max = 0.5, 4.0
+        ma_min, ma_max = 0.5, 1.0
+
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            # Calculate scaling factors for the i-th layer using linear interpolation
+            mf = mf_min + (mf_max - mf_min) * i / (num_layers - 1)
+            ma = ma_min + (ma_max - ma_min) * i / (num_layers - 1)
+
+            # Scale the dimensions according to the scaling factors
+            scaled_mlp_dim = int(mlp_dim * mf)
+            scaled_num_heads = max(1, int(num_heads * ma))
+            scaled_num_heads = nearest_divisor(scaled_num_heads, embed_dim)
+            mlp_ratio = int(scaled_mlp_dim / embed_dim)
+
+            # Choose layer type based on the layer index (even/odd)
+            if i % 2 == 0:  # Even layers use regular DiT
+                self.layers.append(
+                    DiTBlock(
+                        embed_dim, scaled_num_heads, mlp_ratio, 1, 1, attn_drop=dropout
+                    )
+                )
+            else:  # Odd layers use MoE DiT
+                self.layers.append(
+                    DiTBlock(
+                        embed_dim,
+                        scaled_num_heads,
+                        mlp_ratio,
+                        num_experts,
+                        active_experts,
+                        attn_drop=dropout,
+                    )
+                )
+
+        self.output_layer = nn.Linear(embed_dim, input_dim)
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.MultiheadAttention):
+                nn.init.xavier_uniform_(module.in_proj_weight)
+                if module.in_proj_bias is not None:
+                    nn.init.constant_(module.in_proj_bias, 0)
+                nn.init.xavier_uniform_(module.out_proj.weight)
+                if module.out_proj.bias is not None:
+                    nn.init.constant_(module.out_proj.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                if module.weight is not None:
+                    nn.init.constant_(module.weight, 1.0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.TransformerEncoderLayer):
+                # Initialize TransformerEncoderLayer modules
+                # Initialize the self-attention layers
+                nn.init.xavier_uniform_(module.self_attn.in_proj_weight)
+                if module.self_attn.in_proj_bias is not None:
+                    nn.init.constant_(module.self_attn.in_proj_bias, 0)
+                nn.init.xavier_uniform_(module.self_attn.out_proj.weight)
+                if module.self_attn.out_proj.bias is not None:
+                    nn.init.constant_(module.self_attn.out_proj.bias, 0)
+                # Initialize the linear layers in the feedforward network
+                for lin in [module.linear1, module.linear2]:
+                    nn.init.xavier_uniform_(lin.weight)
+                    if lin.bias is not None:
+                        nn.init.constant_(lin.bias, 0)
+                # Initialize the LayerNorm layers
+                for ln in [module.norm1, module.norm2]:
+                    if ln.weight is not None:
+                        nn.init.constant_(ln.weight, 1.0)
+                    if ln.bias is not None:
+                        nn.init.constant_(ln.bias, 0)
+
+        # Apply basic initialization to all modules
+        self.apply(_basic_init)
+
+        # Initialize input and class embeddings
+        nn.init.xavier_uniform_(self.input_embedding.weight)
+        if self.input_embedding.bias is not None:
+            nn.init.constant_(self.input_embedding.bias, 0)
+        nn.init.xavier_uniform_(self.class_embedding.weight)
+        if self.class_embedding.bias is not None:
+            nn.init.constant_(self.class_embedding.bias, 0)
+
+        # Initialize output layer
+        nn.init.xavier_uniform_(self.output_layer.weight)
+        if self.output_layer.bias is not None:
+            nn.init.constant_(self.output_layer.bias, 0)
+
+        # Initialize DiTBlocks if any
+        for layer in self.layers:
+            if isinstance(layer, DiTBlock):
+                layer.initialize_weights()
+
+    def forward(self, x, c_emb):
+        x = self.input_embedding(x)
+        class_emb = self.class_embedding(c_emb)
+
+        for layer in self.layers:
+            x = layer(x, class_emb)
+
+        x = self.output_layer(x)
+        return x
+
+
+class PatchMixer(nn.Module):
+    def __init__(self, embed_dim, num_heads, num_layers=2):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True)
+            for _ in range(num_layers)
+        ])
+
+    def initialize_weights(self):
+        def _init_transformer_layer(module):
+            # Initialize the self-attention layers
+            nn.init.xavier_uniform_(module.self_attn.in_proj_weight)
+            if module.self_attn.in_proj_bias is not None:
+                nn.init.constant_(module.self_attn.in_proj_bias, 0)
+            nn.init.xavier_uniform_(module.self_attn.out_proj.weight)
+            if module.self_attn.out_proj.bias is not None:
+                nn.init.constant_(module.self_attn.out_proj.bias, 0)
+            # Initialize the linear layers in the feedforward network
+            for lin in [module.linear1, module.linear2]:
+                nn.init.xavier_uniform_(lin.weight)
+                if lin.bias is not None:
+                    nn.init.constant_(lin.bias, 0)
+            # Initialize the LayerNorm layers
+            for ln in [module.norm1, module.norm2]:
+                if ln.weight is not None:
+                    nn.init.constant_(ln.weight, 1.0)
+                if ln.bias is not None:
+                    nn.init.constant_(ln.bias, 0)
+
+        # Initialize each TransformerEncoderLayer
+        for layer in self.layers:
+            _init_transformer_layer(layer)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 
 @click.command()
@@ -348,20 +609,22 @@ def main(run, epochs, batch_size):
 
     print(f"model parameters count: {n_params/1e6:.2f}M, ")
 
-    train_loader = DataLoader(
+    t2v_train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
         num_workers=0,
         drop_last=True,
         # collate_fn=jax_collate,
     )
+    
+    optimizer = torch.optim.AdamW(microdit.parameters(), lr=LR)
 
-    sp = next(iter(train_loader))
-    print(f"loaded data \n data sample: {sp['vae_output'].shape}")
+    sp = next(iter(t2v_train_loader))
+    print(f"loaded data \n data sample: latents - {sp[0].shape}, text cond - {sp[1].shape}")
 
     if run == "single_batch":
         model, loss = batch_trainer(
-            epochs, model=dit_model, optimizer=optimizer, train_loader=train_loader
+            epochs, model=dit_model, optimizer=optimizer, train_loader=t2v_train_loader
         )
         wandb.finish()
         print(f"single batch training ended at loss: {loss:.4f}")
