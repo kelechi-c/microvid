@@ -1,13 +1,12 @@
-from torch import nn
-
-
 import torch
 import torch.nn as nn
 import numpy as np
-import math
+import math, click
 from einops import rearrange
 from accelerate import Accelerator
 from collections import defaultdict
+from torch.utils.data import IterableDataset, DataLoader
+from datasets import load_dataset
 from tqdm import tqdm
 import torchvision
 import os, pickle
@@ -30,17 +29,12 @@ def _ntuple(n):
 
 to_2tuple = _ntuple(2)
 
-USERNAME = "SwayStar123"
-DATASET_NAME = "preprocessed_commoncatalog-cc-by"
-DS_DIR_BASE = "../../datasets"
-MODELS_DIR_BASE = "../../models"
+data_id = "tensorkelechi/tiny_webvid_latents"
 VAE_SCALING_FACTOR = 0.13025
-
-BS = 256
+BS = 128
 EPOCHS = 30
 MASK_RATIO = 0.75
-SEED = 42
-
+SEED = 333
 LR = 1e-4
 
 VAE_HF_NAME = "madebyollin/sdxl-vae-fp16-fix"
@@ -49,12 +43,35 @@ SIGLIP_HF_NAME = "hf-hub:timm/ViT-SO400M-14-SigLIP-384"
 SIGLIP_EMBED_DIM = 1152
 
 
-# selected_ids_list = []
+class Text2VideoDataset(IterableDataset):
+    def __init__(self, split=512):
+        super().__init__()
+        self.split = split
+        self.dataset = load_dataset(
+            "tensorkelechi/tiny_webvid_latents",
+            streaming=True,
+            split="train",
+            trust_remote_code=True,
+        ).take(self.split)
+
+    def __len__(self):
+        return self.split
+
+    def __iter__(self):
+        for sample in self.dataset:
+            latents = sample["video_latents"]  # type: ignore
+
+            caption = sample["text_encoded"]  # type: ignore
+
+            yield latents, caption
 
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+
+def t2i_modulate(x, shift, scale):
+    return x * (1 + scale) + shift
 
 def apply_mask_to_tensor(x, mask, patch_size):
     bs, c, d, h, w = x.shape
@@ -155,16 +172,12 @@ def random_mask(
 
 
 def remove_masked_patches(patches, mask):
-
     # Ensure mask is a boolean tensor
     mask = mask.bool()
-
     # Get batch size and embed dimension
     bs, num_patches, embed_dim = patches.shape
-
     # Expand mask to match the shape of patches for correct indexing
     mask = mask.unsqueeze(-1).expand(-1, -1, embed_dim)
-
     # Use masked_select and reshape to maintain batch size
     unmasked_patches = torch.masked_select(patches, mask).view(bs, -1, embed_dim)
 
@@ -172,10 +185,8 @@ def remove_masked_patches(patches, mask):
 
 
 def add_masked_patches(patches, mask):
-
     # Ensure mask is a boolean tensor
     mask = mask.bool()
-
     # Get the total number of patches and embed dimension
     bs, num_patches = mask.shape
     embed_dim = patches.shape[-1]
@@ -325,3 +336,38 @@ class FeedForward(nn.Module):
         x, gate = self.w1(x).chunk(2, dim=-1)
         x = self.w2(F.silu(x) * gate)
         return x
+
+
+@click.command()
+@click.option("-r", "--run", default="single_batch")
+@click.option("-e", "--epochs", default=10)
+@click.option("-bs", "--batch_size", default=32)
+def main(run, epochs, batch_size):
+    # DiT-B config
+    dit_model = DiT(dim=1024, depth=24, attn_heads=16)
+
+    print(f"model parameters count: {n_params/1e6:.2f}M, ")
+
+    train_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=0,
+        drop_last=True,
+        # collate_fn=jax_collate,
+    )
+
+    sp = next(iter(train_loader))
+    print(f"loaded data \n data sample: {sp['vae_output'].shape}")
+
+    if run == "single_batch":
+        model, loss = batch_trainer(
+            epochs, model=dit_model, optimizer=optimizer, train_loader=train_loader
+        )
+        wandb.finish()
+        print(f"single batch training ended at loss: {loss:.4f}")
+
+    elif run == "train":
+        print(f"you missed your train looop impl boy")
+
+
+main()
