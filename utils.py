@@ -1,8 +1,16 @@
 import torch
 import numpy as np
-import os
+import os, subprocess
 import imageio
+from tqdm import tqdm
 from PIL import Image
+
+class config:
+    l_frames = 3
+    l_channels = 256
+    l_height = 7
+    l_width = 7
+    
 
 
 def decode_video_tensor_to_gif(video_tensor, output_path, fps=30, grid_size=None):
@@ -66,6 +74,29 @@ def decode_video_tensor_to_gif(video_tensor, output_path, fps=30, grid_size=None
         frames_batch = np.concatenate(frames_batch, axis=0)
 
         frames_batch_list.append(frames_batch)
-
     # Save as GIF
     imageio.mimsave(output_path, frames_batch_list, fps=fps)
+    
+    return output_path
+
+def save_video(final_frames, output_path, fps=30):
+    frame_paths = []
+    for i, frame in tqdm(enumerate(final_frames), desc=''):
+        frame = (frame * 255).astype(np.uint8)
+        frame_img = Image.fromarray(frame)
+        frame_path = os.path.join(output_path, f"frame_{i:04d}.png")
+        frame_img.save(frame_path)
+        frame_paths.append(frame_path)
+
+    frame_pattern = os.path.join(output_path, "frame_%04d.png")
+    ffmpeg_cmd = f"ffmpeg -y -r {fps} -i {frame_pattern} -vcodec libx264 -pix_fmt yuv420p -preset veryfast {output_path}"
+    try:
+        subprocess.run(
+            ffmpeg_cmd,
+            shell=True,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Error occurred while running ffmpeg:\n{e.stderr.decode()}")
