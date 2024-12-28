@@ -9,8 +9,9 @@ from timm.models.vision_transformer import Attention, Mlp
 from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
 from tqdm import tqdm
+
 import torchvision 
-import os, pickle
+import os, wandb, gc
 import torch.nn.functional as F
 import collections.abc
 import math
@@ -204,6 +205,7 @@ def add_masked_patches(patches, mask):
     full_patches[mask_indices[0], mask_indices[1]] = patches
 
     return full_patches
+
 
 
 class Patchify(nn.Module):
@@ -847,7 +849,7 @@ class PatchMixer(nn.Module):
         return x
 
 
-class MicroDiT(nn.Module):
+class MicroViDiT(nn.Module):
     
     def __init__(
         self,
@@ -856,8 +858,7 @@ class MicroDiT(nn.Module):
         num_heads, mlp_dim,
         caption_embed_dim,
         num_experts=4, active_experts=2,
-        dropout=0.0, patch_mixer_layers=2,
-        embed_cat=False
+        dropout=0.0, patch_mixer_layers=2
     ):
         
         super().__init__()
@@ -1031,7 +1032,19 @@ class MicroDiT(nn.Module):
         
         # Image processing
         x = self.patch_embed(x)  # (batch_size, num_patches, embed_dim)
-        
+        B, N, D = x.shape
+
+        # Calculate the number of spatial patches per frame
+        num_spatial_patches = N // frames
+        # Reshape to add temporal embeddings
+        x = x.reshape(batch_size, frames, num_spatial_patches, self.embed_dim)
+
+        # Add fixed temporal embeddings
+        x = x + self.temporal_embed
+
+        # Flatten back
+        x = x.reshape(batch_size, N, self.embed_dim)
+
         # Generate positional embeddings
         # (height // patch_size_h, width // patch_size_w, embed_dim)
         pos_embed = get_3d_sincos_pos_embed(self.embed_dim, height // patch_size_h, width // patch_size_w)
@@ -1124,12 +1137,26 @@ class MicroDiT(nn.Module):
 @click.option("-e", "--epochs", default=10)
 @click.option("-bs", "--batch_size", default=32)
 def main(run, epochs, batch_size):
+    embed_dim = 768
+    depth = 12
+    
     # DiT-B config
-    microdit = DiT(dim=1024, depth=24, attn_heads=16)
+    microdit = MicroViDiT(
+        in_channels=256,
+        patch_size = (2, 2),
+        embed_dim=embed_dim,
+        num_layers=depth,
+        num_heads=12, 
+        mlp_dim=2*embed_dim,
+        caption_embed_dim=embed_dim,
+        num_experts=4, active_experts=2,
+        dropout=0.0, patch_mixer_layers=4
+    )
 
     n_params = sum(p.numel() for p in microdit.parameters())
     print(f"model parameters count: {n_params/1e6:.2f}M, ")
 
+    dataset = Text2VideoDataset() 
     t2v_train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
