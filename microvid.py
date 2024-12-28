@@ -42,6 +42,7 @@ LR = 1e-4
 VAE_CHANNELS = 256
 
 class config:
+    patch_size = (1, 1)
     l_frames = 3
     l_channels = 256
     l_height = 7
@@ -258,7 +259,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 class Patchify(nn.Module):
     def __init__( 
         self,
-        patch_size: int = 2,
+        patch_size: int = 1,
         in_chans: int = 3,
         embed_dim: int = 768,
         norm_layer = None,
@@ -1183,6 +1184,55 @@ class MicroViDiT(nn.Module):
             
         return latents[-1]
 
+def batch_trainer(
+    epochs,
+    model,
+    optimizer,
+    train_loader,
+    accelerator
+):
+    batch = next(iter(train_loader))
+    patch_size = config.patch_size
+    device = accelerator.device
+    losses = []
+
+    for epoch in range(epochs):
+        # progress_bar = tqdm(dataset, desc=f"Epoch {epoch}", leave=False)
+    # for batch_idx, batch in enumerate(dataset):
+        optimizer.zero_grad()
+        
+        latents = batch["vae_latent"][0].to(device)
+        caption_embeddings = batch["text_embedding"][0].to(device)
+        # print(f'{latents.shape = } / {caption_embeddings.shape = }')
+        bs, c, d, h, w = latents.shape
+        # latents = latents * VAE_SCALING_FACTOR
+
+        mask = random_mask(bs, d, h, w, patch_size=patch_size, mask_ratio=MASK_RATIO).to(device)
+
+        nt = torch.randn((bs,)).to(device)
+        t = torch.sigmoid(nt)
+        
+        texp = t.view([bs, *([1] * len(latents.shape[1:]))]).to(device)
+        z1 = torch.randn_like(latents, device=device)
+        zt = (1 - texp) * latents + texp * z1
+        
+        vtheta = model(zt, t, caption_embeddings, mask)
+
+        latents = apply_mask_to_tensor(latents, mask, patch_size)
+        vtheta = apply_mask_to_tensor(vtheta, mask, patch_size)
+        z1 = apply_mask_to_tensor(z1, mask, patch_size)
+
+        batchwise_mse = ((z1 - latents - vtheta) ** 2).mean(dim=list(range(1, len(latents.shape))))
+        loss = batchwise_mse.mean()
+        loss = loss * 1 / (1 - MASK_RATIO)
+        print(f'epoch {epoch}, loss => {loss.item():.4f}')
+
+        accelerator.backward(loss)
+        optimizer.step()
+
+        if accelerator.is_local_main_process:
+            losses.append(loss.item())
+
 
 
 @click.command()
@@ -1237,8 +1287,11 @@ def main(run, epochs, batch_size):
 
     if run == "single_batch":
         model, loss = batch_trainer(
-            epochs, model=microdit, optimizer=optimizer, train_loader=t2v_train_loader
-        )
+            epochs=epochs, model=microdit, 
+            optimizer=optimizer, train_loader=t2v_train_loader,
+            accelerator=accelerator
+        ) # type: ignore
+        
         wandb.finish()
         print(f"single batch training ended at loss: {loss:.4f}")
 
