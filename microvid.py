@@ -1158,7 +1158,7 @@ class MicroViDiT(nn.Module):
             wp=width // self.patch_size,
             p1=self.patch_size,
             p2=self.patch_size,
-            c=self.out_channels,
+            c=self.out_channels
         )
         
         return x
@@ -1184,6 +1184,7 @@ class MicroViDiT(nn.Module):
             
         return latents[-1]
 
+
 def batch_trainer(
     epochs,
     model,
@@ -1195,8 +1196,12 @@ def batch_trainer(
     patch_size = config.patch_size
     device = accelerator.device
     losses = []
+    
+    # wandb_logger(key='', project_name='microvid')
+    
+    print('start single batch training..../ \n')
 
-    for epoch in range(epochs):
+    for epoch in tqdm(range(epochs), desc='Training...'):
         # progress_bar = tqdm(dataset, desc=f"Epoch {epoch}", leave=False)
     # for batch_idx, batch in enumerate(dataset):
         optimizer.zero_grad()
@@ -1226,12 +1231,38 @@ def batch_trainer(
         loss = batchwise_mse.mean()
         loss = loss * 1 / (1 - MASK_RATIO)
         print(f'epoch {epoch}, loss => {loss.item():.4f}')
-
+        wandb.log({'loss/train': loss.item(), "log_loss/train": math.log10(loss.item())})
+        
         accelerator.backward(loss)
         optimizer.step()
 
         if accelerator.is_local_main_process:
             losses.append(loss.item())
+            
+    return losses[-1]
+            
+
+def wandb_logger(key: str, project_name, run_name=None):
+    # initilaize wandb
+    wandb.login(key=key)
+    wandb.init(
+        project=project_name,
+        name=run_name or None,
+        settings=wandb.Settings(init_timeout=120),
+    )
+
+
+def sample_image_batch(step, model, captions):
+    pred_model = model.eval()
+    image_batch = pred_model.sample(captions)
+    file = f"fmsamples/{step}_microvid.gif"
+    batch = [process_video(x) for x in image_batch]
+
+    gridfile = video_grid(batch, file)
+    print(f"sample saved @ {gridfile}")
+    del pred_model
+
+    return gridfile
 
 
 
@@ -1241,9 +1272,9 @@ def batch_trainer(
 @click.option("-bs", "--batch_size", default=32)
 def main(run, epochs, batch_size):
     embed_dim = 768
-    depth = 12
+    depth = 8
     
-    accelerator = Accelerator(mixed_precision='fp16')
+    accelerator = Accelerator(mixed_precision='bf16')
     device = accelerator.device
 
     ltx_vae = AutoencoderKLLTXVideo.from_pretrained(
@@ -1251,6 +1282,7 @@ def main(run, epochs, batch_size):
     ).to(device)
     ltx_vae.enable_tiling()
     ltx_vae.eval()
+    print('loaded video VAE')
 
     
     # DiT-B config
@@ -1259,7 +1291,7 @@ def main(run, epochs, batch_size):
         patch_size = (2, 2),
         embed_dim=embed_dim,
         num_layers=depth,
-        num_heads=12, 
+        num_heads=12,
         mlp_dim=2*embed_dim,
         caption_embed_dim=embed_dim,
         num_experts=4, active_experts=2,
