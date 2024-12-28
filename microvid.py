@@ -38,11 +38,13 @@ MASK_RATIO = 0.75
 SEED = 333
 LR = 1e-4
 
-VAE_HF_NAME = "madebyollin/sdxl-vae-fp16-fix"
-VAE_CHANNELS = 4
-SIGLIP_HF_NAME = "hf-hub:timm/ViT-SO400M-14-SigLIP-384"
-SIGLIP_EMBED_DIM = 1152
+VAE_CHANNELS = 256
 
+def seed_all(seed=SEED):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+seed_all()
 
 class Text2VideoDataset(IterableDataset):
     def __init__(self, split=512):
@@ -298,67 +300,6 @@ def get_3d_rotary_pos_embed(
         embs.append(emb)
 
     return torch.cat(embs, dim=1)  #  (WHD, D/2) complex
-
-
-if __name__ == "__main__":
-    # Example Usage
-    batch_size = 2
-    seq_len = 32  # T
-    num_heads = 8
-    head_dim = 
-    total_dim = sum(
-        [head_dim // 3, head_dim // 3, head_dim - 2 * (head_dim // 3)]
-    )  # must be equal to head_dim
-    rope_dims = [
-        head_dim // 3,
-        head_dim // 3,
-        head_dim - 2 * (head_dim // 3),
-    ]  # or any other split
-    start = (0, 0, 0)
-    stop = (16, 16, 16)  # Example spatial dimensions.
-    num = (16, 16, 16)  # the spatial resolution after grid interpolation
-
-    # Generate RoPE embeddings
-    freqs_3d = get_3d_rotary_pos_embed(
-        rope_dims, start, stop, num
-    )  # (WHD, D/2) complex
-
-    # Reshape position embedding, because current version does not take into account batch_size and num_heads
-    freqs_3d = freqs_3d.unsqueeze(0).unsqueeze(0)  # [1, 1, WHD, D/2]
-    freqs_3d = freqs_3d.repeat(batch_size, num_heads, 1, 1)  # [B, H, WHD, D/2]
-    freqs_3d = freqs_3d.reshape(
-        batch_size, num_heads, num[0] * num[1] * num[2], total_dim // 2
-    )  # [B, H, WHD, D/2]
-    # Apply RoPE
-    xq_rotated, xk_rotated = apply_rotary_emb(xq, xk, freqs_3d)
-
-
-class SinusoidalPositionalEmbedding(nn.Module):
-    """Apply positional information to a sequence of embeddings.
-
-    Takes in a sequence of embeddings with shape (batch_size, seq_length, embed_dim) and adds positional embeddings to
-    them
-
-    Args:
-        embed_dim: (int): Dimension of the positional embedding.
-        max_seq_length: Maximum sequence length to apply positional embeddings
-    """
-
-    def __init__(self, embed_dim: int, max_seq_length: int = 32):
-        super().__init__()
-        position = torch.arange(max_seq_length).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, embed_dim, 2) * (-math.log(10000.0) / embed_dim)
-        )
-        pe = torch.zeros(1, max_seq_length, embed_dim)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x):
-        _, seq_length, _ = x.shape
-        x = x + self.pe[:, :seq_length]
-        return x
 
 
 class Patchify(nn.Module):
@@ -751,9 +692,10 @@ class DiTBlock(nn.Module):
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(
-            hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs
-        )
+        # self.attn = Attention(
+        #     hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs
+        # )
+        self.attn = nn.MultiheadAttention(hidden_size, num_heads)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # mlp_hidden_dim = int(hidden_size * mlp_ratio)
         # approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -1180,9 +1122,9 @@ class MicroDiT(nn.Module):
         # mask: (batch_size, num_patches)
         
         batch_size, channels, frames, height, width = x.shape
-
-        patch_size_f, patch_size_h, patch_size_w = self.patch_size
-
+        psize_h, psize_w = self.patch_size
+        seq_len = frames * height // psize_h * width // psize_w
+        
         # Image processing
         x = self.patch_embed(x)  # (batch_size, num_patches, embed_dim)
         
@@ -1201,7 +1143,6 @@ class MicroDiT(nn.Module):
 
         mha_out = self.mha(t_emb.unsqueeze(1), c_emb.unsqueeze(1), c_emb.unsqueeze(1))[0].squeeze(1)
         mlp_out = self.mlp(mha_out)
-        
         # Pool + MLP
         pool_out = self.pool_mlp(mlp_out.unsqueeze(2))
 
