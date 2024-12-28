@@ -9,7 +9,7 @@ from timm.models.vision_transformer import Attention, Mlp
 from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
 from tqdm import tqdm
-import torchvision
+import torchvision 
 import os, pickle
 import torch.nn.functional as F
 import collections.abc
@@ -204,56 +204,133 @@ def add_masked_patches(patches, mask):
 
     return full_patches
 
+import torch
+from typing import Tuple, Union, List
 
 
-def get_3d_sincos_pos_embed(embed_dim, grid, w, h, f):
+def get_meshgrid_3d(start, stop, num):
     """
-    grid_size: int of the grid height and width return: pos_embed: [grid_size*grid_size, embed_dim] or
-    [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    Generates a 3D meshgrid using torch.linspace for the specified dimensions.
+
+    Args:
+      start (tuple): Starting coordinates (x, y, z).
+      stop (tuple): Ending coordinates (x, y, z).
+      num (tuple): Number of points in each dimension (x, y, z).
+    Returns:
+      torch.Tensor: [3, W, H, D] representing meshgrid coordinates.
     """
-    grid = rearrange(grid, "c (f h w) -> c f h w", h=h, w=w)
-    grid = rearrange(grid, "c f h w -> c h w f", h=h, w=w)
-    grid = grid.reshape([3, 1, w, h, f])
-    pos_embed = get_3d_sincos_pos_embed_from_grid(embed_dim, grid)
-    pos_embed = pos_embed.transpose(1, 0, 2, 3)
-    return rearrange(pos_embed, "h w f c -> (f h w) c")
+    x = torch.linspace(start[0], stop[0], num[0], dtype=torch.float32)
+    y = torch.linspace(start[1], stop[1], num[1], dtype=torch.float32)
+    z = torch.linspace(start[2], stop[2], num[2], dtype=torch.float32)
+
+    grid_x, grid_y, grid_z = torch.meshgrid(x, y, z, indexing="ij")
+    grid = torch.stack([grid_x, grid_y, grid_z], dim=0)  # [3, W, H, D]
+    return grid
 
 
-def get_3d_sincos_pos_embed_from_grid(embed_dim, grid):
-    if embed_dim % 3 != 0:
-        raise ValueError("embed_dim must be divisible by 3")
-
-    # use half of dimensions to encode grid_h
-    emb_f = get_1d_sincos_pos_embed_from_grid(embed_dim // 3, grid[0])  # (H*W*T, D/3)
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 3, grid[1])  # (H*W*T, D/3)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 3, grid[2])  # (H*W*T, D/3)
-
-    emb = np.concatenate([emb_h, emb_w, emb_f], axis=-1)  # (H*W*T, D)
-    return emb
+def reshape_for_broadcast(freqs, x):
+    """Reshapes frequency tensor for broadcasting with input tensor x (B, S, H, D)."""
+    shape = [d if i == 1 or i == x.ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs.view(*shape)
 
 
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position pos: a list of positions to be encoded: size (M,) out: (M, D)
-    """
-    if embed_dim % 2 != 0:
-        raise ValueError("embed_dim must be divisible by 2")
+def rotate_half(x):
+    """Rotates the last dimension of tensor x by half its size. [B, S, H, D] -> [B, S, H, D]"""
+    x_real, x_imag = x.float().reshape(*x.shape[:-1], -1, 2).unbind(-1)
+    return torch.stack([-x_imag, x_real], dim=-1).flatten(3)
 
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega  # (D/2,)
 
-    pos_shape = pos.shape
+def apply_rotary_emb(xq, xk, freqs_cis):
+    """Applies rotary embeddings to query and key tensors. [B, S, H, D] -> [B, S, H, D]"""
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq).to(xq.device)
+    xq_rotated = (
+        xq.float() * freqs_cis.cos() + rotate_half(xq.float()) * freqs_cis.sin()
+    ).type_as(xq)
+    xk_rotated = (
+        xk.float() * freqs_cis.cos() + rotate_half(xk.float()) * freqs_cis.sin()
+    ).type_as(xk)
+    return xq_rotated, xk_rotated
 
-    pos = pos.reshape(-1)
-    out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
-    out = out.reshape([*pos_shape, -1])[0]
 
-    emb_sin = np.sin(out)  # (M, D/2)
-    emb_cos = np.cos(out)  # (M, D/2)
+def get_1d_rotary_pos_embed(
+    dim: int,
+    pos: torch.Tensor,
+    theta: float = 10000.0,
+    theta_rescale_factor: float = 1.0,
+    interpolation_factor: float = 1.0,
+):
+    """Generates 1D RoPE embeddings for the specified dim and position, using complex numbers"""
+    if theta_rescale_factor != 1.0:
+        theta *= theta_rescale_factor ** (dim / (dim - 2))
+    freqs = 1.0 / (
+        theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)] / dim)
+    )
+    freqs = torch.outer(pos * interpolation_factor, freqs)
+    return torch.polar(torch.ones_like(freqs), freqs)  # complex numbers
 
-    emb = np.concatenate([emb_sin, emb_cos], axis=-1)  # (M, D)
-    return emb
+
+def get_3d_rotary_pos_embed(
+    rope_dims: List[int],
+    start: tuple,
+    stop: tuple,
+    num: tuple,
+    theta: float = 10000.0,
+    theta_rescale_factor: Union[float, List[float]] = 1.0,
+    interpolation_factor: Union[float, List[float]] = 1.0,
+):
+    """Generates 3D RoPE embeddings."""
+    grid = get_meshgrid_3d(start, stop, num)  # [3, W, H, D]
+
+    if isinstance(theta_rescale_factor, (int, float)):
+        theta_rescale_factor = [theta_rescale_factor] * 3
+    if isinstance(interpolation_factor, (int, float)):
+        interpolation_factor = [interpolation_factor] * 3
+
+    embs = []
+    for i in range(3):  # iterating across spatial dimensions
+        emb = get_1d_rotary_pos_embed(
+            rope_dims[i],
+            grid[i].reshape(-1),
+            theta,
+            theta_rescale_factor=theta_rescale_factor[i],
+            interpolation_factor=interpolation_factor[i],
+        )
+        embs.append(emb)
+
+    return torch.cat(embs, dim=1)  #  (WHD, D/2) complex
+
+
+if __name__ == "__main__":
+    # Example Usage
+    batch_size = 2
+    seq_len = 32  # T
+    num_heads = 8
+    head_dim = 
+    total_dim = sum(
+        [head_dim // 3, head_dim // 3, head_dim - 2 * (head_dim // 3)]
+    )  # must be equal to head_dim
+    rope_dims = [
+        head_dim // 3,
+        head_dim // 3,
+        head_dim - 2 * (head_dim // 3),
+    ]  # or any other split
+    start = (0, 0, 0)
+    stop = (16, 16, 16)  # Example spatial dimensions.
+    num = (16, 16, 16)  # the spatial resolution after grid interpolation
+
+    # Generate RoPE embeddings
+    freqs_3d = get_3d_rotary_pos_embed(
+        rope_dims, start, stop, num
+    )  # (WHD, D/2) complex
+
+    # Reshape position embedding, because current version does not take into account batch_size and num_heads
+    freqs_3d = freqs_3d.unsqueeze(0).unsqueeze(0)  # [1, 1, WHD, D/2]
+    freqs_3d = freqs_3d.repeat(batch_size, num_heads, 1, 1)  # [B, H, WHD, D/2]
+    freqs_3d = freqs_3d.reshape(
+        batch_size, num_heads, num[0] * num[1] * num[2], total_dim // 2
+    )  # [B, H, WHD, D/2]
+    # Apply RoPE
+    xq_rotated, xk_rotated = apply_rotary_emb(xq, xk, freqs_3d)
 
 
 class SinusoidalPositionalEmbedding(nn.Module):
@@ -265,7 +342,6 @@ class SinusoidalPositionalEmbedding(nn.Module):
     Args:
         embed_dim: (int): Dimension of the positional embedding.
         max_seq_length: Maximum sequence length to apply positional embeddings
-
     """
 
     def __init__(self, embed_dim: int, max_seq_length: int = 32):
@@ -301,7 +377,7 @@ class Patchify(nn.Module):
         self.flatten = flatten
         self.dynamic_img_pad = dynamic_img_pad
 
-        self.conv_proj = nn.Conv2d(
+        self.conv_proj = nn.Conv3d(
             in_chans,
             embed_dim,
             kernel_size=patch_size,
@@ -753,6 +829,13 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
+def nearest_divisor(scaled_num_heads, embed_dim):
+    # Find all divisors of embed_dim
+    divisors = [i for i in range(1, embed_dim + 1) if embed_dim % i == 0]
+    # Find the nearest divisor
+    nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
+    
+    return nearest
 
 class TransformerBackbone(nn.Module):
     def __init__(
@@ -765,7 +848,7 @@ class TransformerBackbone(nn.Module):
         mlp_dim: int,
         num_experts: int = 4,
         active_experts: int = 2,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.input_embedding = nn.Linear(input_dim, embed_dim)
@@ -920,8 +1003,17 @@ class PatchMixer(nn.Module):
 
 class MicroDiT(nn.Module):
     
-    def __init__(self, in_channels, patch_size, embed_dim, num_layers, num_heads, mlp_dim, caption_embed_dim,
-                 num_experts=4, active_experts=2, dropout=0.1, patch_mixer_layers=2, embed_cat=False):
+    def __init__(
+        self,
+        in_channels, patch_size: tuple,
+        embed_dim, num_layers,
+        num_heads, mlp_dim,
+        caption_embed_dim,
+        num_experts=4, active_experts=2,
+        dropout=0.0, patch_mixer_layers=2,
+        embed_cat=False
+    ):
+        
         super().__init__()
         
         self.patch_size = patch_size
@@ -1087,16 +1179,16 @@ class MicroDiT(nn.Module):
         # caption_embeddings: (batch_size, caption_embed_dim)
         # mask: (batch_size, num_patches)
         
-        batch_size, channels, height, width = x.shape
+        batch_size, channels, frames, height, width = x.shape
 
-        patch_size_h, patch_size_w = self.patch_size
+        patch_size_f, patch_size_h, patch_size_w = self.patch_size
 
         # Image processing
         x = self.patch_embed(x)  # (batch_size, num_patches, embed_dim)
         
         # Generate positional embeddings
         # (height // patch_size_h, width // patch_size_w, embed_dim)
-        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, height // patch_size_h, width // patch_size_w)
+        pos_embed = get_3d_sincos_pos_embed(self.embed_dim, height // patch_size_h, width // patch_size_w)
         pos_embed = pos_embed.to(x.device).unsqueeze(0).expand(batch_size, -1, -1)
         
         x = x + pos_embed
@@ -1169,7 +1261,8 @@ class MicroDiT(nn.Module):
 
             z = z - dt * vc
             images.append(z)
-        return (images[-1] / 
+            
+        return images[-1]
 
 
 @click.command()
