@@ -4,12 +4,13 @@ import numpy as np
 import math, click
 from einops import rearrange
 from accelerate import Accelerator
+from diffusers import AutoencoderKLLTXVideo
 from collections import defaultdict
 from timm.models.vision_transformer import Attention, Mlp
 from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
-from tqdm import tqdm
 
+from tqdm import tqdm
 import torchvision 
 import os, wandb, gc
 import torch.nn.functional as F
@@ -1166,7 +1167,8 @@ class MicroViDiT(nn.Module):
         b = z.size(0)
         dt = 1.0 / sample_steps
         dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
-        images = [z]
+        latents = [z]
+        
         for i in range(sample_steps, 0, -1):
             t = i / sample_steps
             t = torch.tensor([t] * b).to(z.device).to(torch.float16)
@@ -1177,9 +1179,10 @@ class MicroViDiT(nn.Module):
             vc = vu + cfg * (vc - vu)
 
             z = z - dt * vc
-            images.append(z)
+            latents.append(z)
             
-        return images[-1]
+        return latents[-1]
+
 
 
 @click.command()
@@ -1189,6 +1192,16 @@ class MicroViDiT(nn.Module):
 def main(run, epochs, batch_size):
     embed_dim = 768
     depth = 12
+    
+    accelerator = Accelerator(mixed_precision='fp16')
+    device = accelerator.device
+
+    ltx_vae = AutoencoderKLLTXVideo.from_pretrained(
+        "Lightricks/LTX-Video", subfolder="vae", torch_dtype=torch.bfloat16
+    ).to(device)
+    ltx_vae.enable_tiling()
+    ltx_vae.eval()
+
     
     # DiT-B config
     microdit = MicroViDiT(
@@ -1201,7 +1214,7 @@ def main(run, epochs, batch_size):
         caption_embed_dim=embed_dim,
         num_experts=4, active_experts=2,
         dropout=0.0, patch_mixer_layers=4
-    )
+    ).to(device)
 
     n_params = sum(p.numel() for p in microdit.parameters())
     print(f"model parameters count: {n_params/1e6:.2f}M, ")
@@ -1220,9 +1233,11 @@ def main(run, epochs, batch_size):
     sp = next(iter(t2v_train_loader))
     print(f"loaded data \n data sample: latents - {sp[0].shape}, text cond - {sp[1].shape}")
 
+    microdit, optimizer, t2v_train_loader = accelerator.prepare(microdit, optimizer, t2v_train_loader)
+
     if run == "single_batch":
         model, loss = batch_trainer(
-            epochs, model=dit_model, optimizer=optimizer, train_loader=t2v_train_loader
+            epochs, model=microdit, optimizer=optimizer, train_loader=t2v_train_loader
         )
         wandb.finish()
         print(f"single batch training ended at loss: {loss:.4f}")
