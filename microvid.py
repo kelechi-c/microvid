@@ -32,7 +32,6 @@ def _ntuple(n):
 to_2tuple = _ntuple(2)
 
 data_id = "tensorkelechi/tiny_webvid_latents"
-VAE_SCALING_FACTOR = 0.13025
 BS = 128
 EPOCHS = 30
 MASK_RATIO = 0.75
@@ -41,17 +40,25 @@ LR = 1e-4
 
 VAE_CHANNELS = 256
 
+class config:
+    l_frames = 3
+    l_channels = 256
+    l_height = 7
+    l_width = 7
+    lr = 1e-4
+
 def seed_all(seed=SEED):
     np.random.seed(seed)
     torch.manual_seed(seed)
 seed_all()
+
 
 class Text2VideoDataset(IterableDataset):
     def __init__(self, split=512):
         super().__init__()
         self.split = split
         self.dataset = load_dataset(
-            "tensorkelechi/tiny_webvid_latents",
+            data_id,
             streaming=True,
             split="train",
             trust_remote_code=True,
@@ -953,6 +960,10 @@ class MicroViDiT(nn.Module):
             nn.GELU(),
             nn.Linear(self.embed_dim, patch_size[0] * patch_size[1] * in_channels)
         )
+        
+        # Fixed temporal embedding layer
+        self.temporal_embed = nn.Parameter(torch.zeros(1, config.num_frames, embed_dim))
+        nn.init.normal_(self.temporal_embed)  # Initialize temporal embeddings
 
         self.initialize_weights()
 
@@ -1086,7 +1097,7 @@ class MicroViDiT(nn.Module):
 
         # Generate positional embeddings
         # (height // patch_size_h, width // patch_size_w, embed_dim)
-        pos_embed = get_3d_sincos_pos_embed(self.embed_dim, height // patch_size_h, width // patch_size_w)
+        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, height // psize_h, width // psize_w)
         pos_embed = pos_embed.to(x.device).unsqueeze(0).expand(batch_size, -1, -1)
         
         x = x + pos_embed
