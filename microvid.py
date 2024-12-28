@@ -377,7 +377,7 @@ class Patchify(nn.Module):
         self.flatten = flatten
         self.dynamic_img_pad = dynamic_img_pad
 
-        self.conv_proj = nn.Conv3d(
+        self.conv_proj = nn.Conv2d(
             in_chans,
             embed_dim,
             kernel_size=patch_size,
@@ -1016,7 +1016,7 @@ class MicroDiT(nn.Module):
         
         super().__init__()
         
-        self.patch_size = patch_size
+        self.patch_tuple = patch_size
         self.embed_dim = embed_dim
         
         # Image processing
@@ -1240,7 +1240,16 @@ class MicroDiT(nn.Module):
             # (bs, unmasked_num_patches, patch_size_h * patch_size_w * in_channels) -> (bs, num_patches, patch_size_h * patch_size_w * in_channels)
             x = add_masked_patches(x, mask)
 
-        x = unpatchify(x, self.patch_size, height, width)
+        x = rearrange(
+            x,
+            "B (T hp wp) (p1 p2 c) -> B c T (hp p1) (wp p2)",
+            T=frames,
+            hp=height // self.patch_size,
+            wp=width // self.patch_size,
+            p1=self.patch_size,
+            p2=self.patch_size,
+            c=self.out_channels,
+        )
         
         return x
     
