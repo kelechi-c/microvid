@@ -11,7 +11,7 @@ from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
 from moviepy.video.io import ImageSequenceClip
 from tqdm import tqdm
-import torchvision 
+import torchvision, imageio
 import os, wandb, gc
 import torch.nn.functional as F
 import collections.abc
@@ -33,7 +33,7 @@ EPOCHS = 30
 MASK_RATIO = 0.75
 SEED = 333
 LR = 1e-4
-
+scale_factor = 0.18215
 VAE_CHANNELS = 256
 
 class config:
@@ -1235,7 +1235,73 @@ def batch_trainer(
             losses.append(loss.item())
             
     return losses[-1]
-            
+
+def decode_video_tensor_to_gif(video_tensor, output_path, fps=30, grid_size=None):
+    """
+    Decodes a video tensor batch back into a video grid and saves it as a GIF.
+
+    Args:
+        video_tensor (torch.Tensor): A tensor of shape (B, C, T, H, W) representing a batch of videos.
+            - B: Batch size (number of videos)
+            - C: Number of channels (e.g., 3 for RGB)
+            - T: Number of frames
+            - H: Height of the frame
+            - W: Width of the frame
+        output_path (str): Path to the output GIF file.
+        fps (int, optional): Frames per second for the output GIF. Defaults to 30.
+        grid_size (tuple[int, int], optional): Tuple of (rows, cols) for creating a grid of videos, default is None,
+                                                which will use a horizontal grid of all videos in batch.
+    """
+
+    if not isinstance(video_tensor, torch.Tensor):
+        raise TypeError("Input video_tensor must be a torch.Tensor")
+
+    if video_tensor.ndim != 5:
+        raise ValueError(
+            f"Video tensor must have 5 dimensions (B, C, T, H, W), got {video_tensor.ndim}"
+        )
+
+    batch_size, channels, num_frames, height, width = video_tensor.shape
+
+    if grid_size is None:
+        grid_rows = 1
+        grid_cols = batch_size
+    else:
+        grid_rows, grid_cols = grid_size
+        if grid_rows * grid_cols != batch_size:
+            raise ValueError(
+                f"grid_size rows * cols {grid_rows * grid_cols} must match batch size {batch_size}"
+            )
+
+    frames_batch_list = []
+
+    for frame_idx in range(num_frames):
+        # create a grid of frames from each video
+        frames_batch = []
+        for row_idx in range(grid_rows):
+            frame_row = []
+            for col_idx in range(grid_cols):
+                video_idx = row_idx * grid_cols + col_idx
+                frame = video_tensor[video_idx, :, frame_idx, :, :]
+                frame = frame.permute(1, 2, 0).cpu().numpy()
+                frame = (frame * 255).astype(
+                    np.uint8
+                )  # Ensure frame is in [0, 255] range
+                if frame.shape[2] == 1:  # convert graycale to RGB
+                    frame = np.concatenate(
+                        [frame, frame, frame], axis=2
+                    )  # convert to RGB
+                frame_row.append(frame)
+            frame_row = np.concatenate(frame_row, axis=1)
+            frames_batch.append(frame_row)
+        frames_batch = np.concatenate(frames_batch, axis=0)
+
+        frames_batch_list.append(frames_batch)
+    # Save as GIF
+    imageio.mimsave(output_path, frames_batch_list, fps=fps)
+    
+    return output_path
+
 
 def wandb_logger(key: str, project_name, run_name=None):
     # initilaize wandb
@@ -1250,9 +1316,14 @@ def save_video(final_frames, output_path='sample.mp4', fps=4):
     assert final_frames.ndim == 4 and final_frames.shape[3] == 3, f"invalid shape: {final_frames} (need t h w c)"
     if final_frames.dtype != np.uint8:
         final_frames = (final_frames * 255).astype(np.uint8)
+        
     ImageSequenceClip(list(final_frames), fps=fps).write_videofile(output_path)
     
     return output_path
+
+def process_video_latents(latents, vae=ltx_vae):
+    latents = vae.tiled_decode(latents)
+    return latents  / scale_factor
 
 
 def sample_image_batch(step, model, captions):
@@ -1266,7 +1337,6 @@ def sample_image_batch(step, model, captions):
     del pred_model
 
     return gridfile
-
 
 
 @click.command()
