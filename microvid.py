@@ -43,7 +43,6 @@ VAE_CHANNELS = 256
 def seed_all(seed=SEED):
     np.random.seed(seed)
     torch.manual_seed(seed)
-
 seed_all()
 
 class Text2VideoDataset(IterableDataset):
@@ -205,101 +204,6 @@ def add_masked_patches(patches, mask):
     full_patches[mask_indices[0], mask_indices[1]] = patches
 
     return full_patches
-
-import torch
-from typing import Tuple, Union, List
-
-
-def get_meshgrid_3d(start, stop, num):
-    """
-    Generates a 3D meshgrid using torch.linspace for the specified dimensions.
-
-    Args:
-      start (tuple): Starting coordinates (x, y, z).
-      stop (tuple): Ending coordinates (x, y, z).
-      num (tuple): Number of points in each dimension (x, y, z).
-    Returns:
-      torch.Tensor: [3, W, H, D] representing meshgrid coordinates.
-    """
-    x = torch.linspace(start[0], stop[0], num[0], dtype=torch.float32)
-    y = torch.linspace(start[1], stop[1], num[1], dtype=torch.float32)
-    z = torch.linspace(start[2], stop[2], num[2], dtype=torch.float32)
-
-    grid_x, grid_y, grid_z = torch.meshgrid(x, y, z, indexing="ij")
-    grid = torch.stack([grid_x, grid_y, grid_z], dim=0)  # [3, W, H, D]
-    return grid
-
-
-def reshape_for_broadcast(freqs, x):
-    """Reshapes frequency tensor for broadcasting with input tensor x (B, S, H, D)."""
-    shape = [d if i == 1 or i == x.ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs.view(*shape)
-
-
-def rotate_half(x):
-    """Rotates the last dimension of tensor x by half its size. [B, S, H, D] -> [B, S, H, D]"""
-    x_real, x_imag = x.float().reshape(*x.shape[:-1], -1, 2).unbind(-1)
-    return torch.stack([-x_imag, x_real], dim=-1).flatten(3)
-
-
-def apply_rotary_emb(xq, xk, freqs_cis):
-    """Applies rotary embeddings to query and key tensors. [B, S, H, D] -> [B, S, H, D]"""
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq).to(xq.device)
-    xq_rotated = (
-        xq.float() * freqs_cis.cos() + rotate_half(xq.float()) * freqs_cis.sin()
-    ).type_as(xq)
-    xk_rotated = (
-        xk.float() * freqs_cis.cos() + rotate_half(xk.float()) * freqs_cis.sin()
-    ).type_as(xk)
-    return xq_rotated, xk_rotated
-
-
-def get_1d_rotary_pos_embed(
-    dim: int,
-    pos: torch.Tensor,
-    theta: float = 10000.0,
-    theta_rescale_factor: float = 1.0,
-    interpolation_factor: float = 1.0,
-):
-    """Generates 1D RoPE embeddings for the specified dim and position, using complex numbers"""
-    if theta_rescale_factor != 1.0:
-        theta *= theta_rescale_factor ** (dim / (dim - 2))
-    freqs = 1.0 / (
-        theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)] / dim)
-    )
-    freqs = torch.outer(pos * interpolation_factor, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)  # complex numbers
-
-
-def get_3d_rotary_pos_embed(
-    rope_dims: List[int],
-    start: tuple,
-    stop: tuple,
-    num: tuple,
-    theta: float = 10000.0,
-    theta_rescale_factor: Union[float, List[float]] = 1.0,
-    interpolation_factor: Union[float, List[float]] = 1.0,
-):
-    """Generates 3D RoPE embeddings."""
-    grid = get_meshgrid_3d(start, stop, num)  # [3, W, H, D]
-
-    if isinstance(theta_rescale_factor, (int, float)):
-        theta_rescale_factor = [theta_rescale_factor] * 3
-    if isinstance(interpolation_factor, (int, float)):
-        interpolation_factor = [interpolation_factor] * 3
-
-    embs = []
-    for i in range(3):  # iterating across spatial dimensions
-        emb = get_1d_rotary_pos_embed(
-            rope_dims[i],
-            grid[i].reshape(-1),
-            theta,
-            theta_rescale_factor=theta_rescale_factor[i],
-            interpolation_factor=interpolation_factor[i],
-        )
-        embs.append(emb)
-
-    return torch.cat(embs, dim=1)  #  (WHD, D/2) complex
 
 
 class Patchify(nn.Module):
