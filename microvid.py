@@ -9,7 +9,7 @@ from collections import defaultdict
 from timm.models.vision_transformer import Attention, Mlp
 from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
-
+from moviepy.video.io import ImageSequenceClip
 from tqdm import tqdm
 import torchvision 
 import os, wandb, gc
@@ -19,18 +19,13 @@ import math
 from itertools import repeat
 from typing import Callable, Optional
 
+ltx_vae = AutoencoderKLLTXVideo.from_pretrained(
+    "Lightricks/LTX-Video", subfolder="vae", torch_dtype=torch.bfloat16
+).to(device)
+ltx_vae.enable_tiling()
+ltx_vae.eval()
+print('loaded video VAE')
 
-# From PyTorch internals
-def _ntuple(n):
-    def parse(x):
-        if isinstance(x, collections.abc.Iterable) and not isinstance(x, str):
-            return tuple(x)
-        return tuple(repeat(x, n))
-
-    return parse
-
-
-to_2tuple = _ntuple(2)
 
 data_id = "tensorkelechi/tiny_webvid_latents"
 BS = 128
@@ -268,7 +263,7 @@ class Patchify(nn.Module):
         dynamic_img_pad: bool = False,
     ):
         super().__init__()
-        self.patch_size = to_2tuple(patch_size)
+        self.patch_size = (patch_size, patch_size)
         self.flatten = flatten
         self.dynamic_img_pad = dynamic_img_pad
 
@@ -1251,6 +1246,14 @@ def wandb_logger(key: str, project_name, run_name=None):
         settings=wandb.Settings(init_timeout=120),
     )
 
+def save_video(final_frames, output_path='sample.mp4', fps=4):
+    assert final_frames.ndim == 4 and final_frames.shape[3] == 3, f"invalid shape: {final_frames} (need t h w c)"
+    if final_frames.dtype != np.uint8:
+        final_frames = (final_frames * 255).astype(np.uint8)
+    ImageSequenceClip(list(final_frames), fps=fps).write_videofile(output_path)
+    
+    return output_path
+
 
 def sample_image_batch(step, model, captions):
     pred_model = model.eval()
@@ -1276,14 +1279,6 @@ def main(run, epochs, batch_size):
     
     accelerator = Accelerator(mixed_precision='bf16')
     device = accelerator.device
-
-    ltx_vae = AutoencoderKLLTXVideo.from_pretrained(
-        "Lightricks/LTX-Video", subfolder="vae", torch_dtype=torch.bfloat16
-    ).to(device)
-    ltx_vae.enable_tiling()
-    ltx_vae.eval()
-    print('loaded video VAE')
-
     
     # DiT-B config
     microdit = MicroViDiT(
