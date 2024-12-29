@@ -653,7 +653,6 @@ class FeedForward(nn.Module):
         x = self.w2(F.silu(x) * gate)
         return x
 
-
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
@@ -675,7 +674,9 @@ class DiTBlock(nn.Module):
         # self.attn = Attention(
         #     hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs
         # )
-        self.attn = nn.MultiheadAttention(hidden_size, num_heads)
+        self.attn = Attention(
+            hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs
+        ) #nn.MultiheadAttention(hidden_size, num_heads)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # mlp_hidden_dim = int(hidden_size * mlp_ratio)
         # approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -718,15 +719,16 @@ class DiTBlock(nn.Module):
                 nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
     def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(c).chunk(6, dim=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+
+        x = x + gate_msa * self.attn(
+            t2i_modulate(self.norm1(x), shift_msa, scale_msa)
         )
-        x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa)
+        print(x.shape)
+        x = x + gate_mlp * self.moe(
+            t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)
         )
-        x = x + gate_mlp.unsqueeze(1) * self.moe(
-            modulate(self.norm2(x), shift_mlp, scale_mlp)
-        )
+        print(f'block shape {x.shape}')
         return x
 
 
@@ -746,10 +748,11 @@ class FinalLayer(nn.Module):
         )
 
     def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        x = t2i_modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
+    
 
 def nearest_divisor(scaled_num_heads, embed_dim):
     # Find all divisors of embed_dim
