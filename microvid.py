@@ -211,6 +211,76 @@ def add_masked_patches(patches, mask):
     return full_patches
 
 
+def get_3d_sincos_pos_embed(embed_dim, t, h, w):
+    """
+    Generates 3D sinusoidal positional embeddings.
+
+    Args:
+        embed_dim (int): Embedding dimension.
+        t (int): Number of time steps (frames).
+        h (int): Height of the spatial grid.
+        w (int): Width of the spatial grid.
+
+    Returns:
+        torch.Tensor: Positional embeddings of shape (T*H*W, embed_dim).
+    """
+    grid_t = torch.arange(t, dtype=torch.float32)
+    grid_h = torch.arange(h, dtype=torch.float32)
+    grid_w = torch.arange(w, dtype=torch.float32)
+    grid_t, grid_h, grid_w = torch.meshgrid(grid_t, grid_h, grid_w, indexing="ij")
+    grid = torch.stack([grid_t, grid_h, grid_w], dim=0)  # Shape: (3, T, H, W)
+
+    grid = grid.reshape([3, t, h, w])
+    pos_embed = get_3d_sincos_pos_embed_from_grid(embed_dim, grid)
+    return pos_embed
+
+def get_3d_sincos_pos_embed_from_grid(embed_dim, grid):
+    """
+    Generates 3D sinusoidal positional embeddings from a grid.
+
+    Args:
+        embed_dim (int): Embedding dimension.
+        grid (torch.Tensor): Grid coordinates of shape (3, T, H, W).
+
+    Returns:
+        torch.Tensor: Positional embeddings of shape (T*H*W, embed_dim).
+    """
+    assert embed_dim % 2 == 0
+    emb_dim_per_axis = embed_dim // 3  # Divide embedding dimension across 3 axes
+    assert emb_dim_per_axis % 2 == 0
+
+    emb_t = get_1d_sincos_pos_embed_from_grid(emb_dim_per_axis, grid[0])  # (T*H*W, D/3)
+    emb_h = get_1d_sincos_pos_embed_from_grid(emb_dim_per_axis, grid[1])  # (T*H*W, D/3)
+    emb_w = get_1d_sincos_pos_embed_from_grid(emb_dim_per_axis, grid[2])  # (T*H*W, D/3)
+
+    emb = torch.cat([emb_t, emb_h, emb_w], dim=1)  # (T*H*W, D)
+    return emb
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    Generates 1D sinusoidal positional embeddings from grid positions.
+
+    Args:
+        embed_dim (int): Embedding dimension.
+        pos (torch.Tensor): 1D position coordinates.
+
+    Returns:
+        torch.Tensor: Positional embeddings of shape (M, embed_dim).
+    """
+    assert embed_dim % 2 == 0
+    omega = torch.arange(embed_dim // 2, dtype=torch.float32)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / (10000**omega)  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = torch.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
+
+    emb_sin = torch.sin(out)  # (M, D/2)
+    emb_cos = torch.cos(out)  # (M, D/2)
+
+    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
+    return emb
+
 def get_2d_sincos_pos_embed(embed_dim, h, w):
     
     grid_h = torch.arange(h, dtype=torch.float32)
@@ -1322,17 +1392,18 @@ def save_video(final_frames, output_path='sample.mp4', fps=4):
     return output_path
 
 def process_video_latents(latents, vae=ltx_vae):
-    latents = vae.tiled_decode(latents)
-    return latents  / scale_factor
+    latents = vae.tiled_decode(latents) / scale_factor
+    latents = rearrange(latents, 'b c t h w -> b t c h w')
 
+    return latents
 
-def sample_image_batch(step, model, captions):
+def sample_video(step, model, captions):
     pred_model = model.eval()
     image_batch = pred_model.sample(captions)
     file = f"fmsamples/{step}_microvid.gif"
-    batch = [process_video(x) for x in image_batch]
+    batch = [process_video_latents(x) for x in image_batch]
 
-    gridfile = video_grid(batch, file)
+    gridfile = decode_video_tensor_to_gif(batch, file)
     print(f"sample saved @ {gridfile}")
     del pred_model
 
