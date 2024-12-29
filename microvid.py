@@ -281,45 +281,6 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
     return emb
 
-def get_2d_sincos_pos_embed(embed_dim, h, w):
-    
-    grid_h = torch.arange(h, dtype=torch.float32)
-    grid_w = torch.arange(w, dtype=torch.float32)
-    grid = torch.meshgrid(grid_h, grid_w, indexing="ij")
-    grid = torch.stack(grid, dim=0)
-
-    grid = grid.reshape([2, 1, h, w])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    return pos_embed
-
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = torch.cat([emb_h, emb_w], dim=1)  # (H*W, D)
-    return emb
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-
-    assert embed_dim % 2 == 0
-    omega = torch.arange(embed_dim // 2, dtype=torch.float32)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = torch.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
-
-    emb_sin = torch.sin(out)  # (M, D/2)
-    emb_cos = torch.cos(out)  # (M, D/2)
-
-    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
-    return emb
-
 
 class Patchify(nn.Module):
     def __init__( 
@@ -963,7 +924,7 @@ class PatchMixer(nn.Module):
 
 
 class MicroViDiT(nn.Module):
-    
+
     def __init__(
         self,
         in_channels, patch_size: tuple,
@@ -973,18 +934,23 @@ class MicroViDiT(nn.Module):
         num_experts=4, active_experts=2,
         dropout=0.0, patch_mixer_layers=2
     ):
-        
+
         super().__init__()
-        
-        self.patch_tuple = patch_size
+
+        self.patch_size = patch_size
         self.embed_dim = embed_dim
-        
+        self.out_channels = in_channels
+
         # Image processing
-        self.patch_embed = Patchify(in_channels, embed_dim, patch_size)
-        
+        self.patch_embed = Patchify(
+            patch_size= patch_size[0],
+            in_chans = in_channels,
+            embed_dim = embed_dim
+          )
+
         # Timestep embedding
         self.time_embed = TimestepEmbedder(self.embed_dim)
-        
+
         # Caption embedding
         self.caption_embed = nn.Sequential(
             nn.Linear(caption_embed_dim, self.embed_dim),
@@ -994,14 +960,14 @@ class MicroViDiT(nn.Module):
 
         # MHA for timestep and caption
         self.mha = nn.MultiheadAttention(self.embed_dim, num_heads, batch_first=True)
-        
+
         # MLP for timestep and caption
         self.mlp = nn.Sequential(
             nn.Linear(self.embed_dim, self.embed_dim),
             nn.GELU(),
             nn.Linear(self.embed_dim, self.embed_dim)
         )
-        
+
         # Pool + MLP for (MHA + MLP)
         self.pool_mlp = nn.Sequential(
             nn.AdaptiveAvgPool1d(1),
@@ -1010,26 +976,26 @@ class MicroViDiT(nn.Module):
             nn.GELU(),
             nn.Linear(self.embed_dim, self.embed_dim)
         )
-        
+
         # Linear layer after MHA+MLP
         self.linear = nn.Linear(self.embed_dim, self.embed_dim)
-        
+
         # Patch-mixer
         self.patch_mixer = PatchMixer(self.embed_dim, num_heads, patch_mixer_layers)
-        
+
         # Backbone transformer model
-        self.backbone = TransformerBackbone(self.embed_dim, self.embed_dim, self.embed_dim, num_layers, num_heads, mlp_dim, 
+        self.backbone = TransformerBackbone(self.embed_dim, self.embed_dim, self.embed_dim, num_layers, num_heads, mlp_dim,
                                         num_experts, active_experts, dropout)
-        
+
         # Output layer
         self.output = nn.Sequential(
             nn.Linear(self.embed_dim, self.embed_dim),
             nn.GELU(),
             nn.Linear(self.embed_dim, patch_size[0] * patch_size[1] * in_channels)
         )
-        
+
         # Fixed temporal embedding layer
-        self.temporal_embed = nn.Parameter(torch.zeros(1, config.num_frames, embed_dim))
+        self.temporal_embed = nn.Parameter(torch.zeros(1, 3, embed_dim))
         nn.init.normal_(self.temporal_embed)  # Initialize temporal embeddings
 
         self.initialize_weights()
@@ -1087,10 +1053,10 @@ class MicroViDiT(nn.Module):
         # [Rest of the initialization code remains the same...]
 
         # Initialize the patch embedding projection
-        w = self.patch_embed.proj.weight.data
+        w = self.patch_embed.conv_proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        if self.patch_embed.proj.bias is not None:
-            nn.init.constant_(self.patch_embed.proj.bias, 0)
+        if self.patch_embed.conv_proj.bias is not None:
+            nn.init.constant_(self.patch_embed.conv_proj.bias, 0)
 
         # Initialize timestep embedding MLP
         nn.init.normal_(self.time_embed.mlp[0].weight, std=0.02)
@@ -1142,51 +1108,48 @@ class MicroViDiT(nn.Module):
         # t: (batch_size, 1)
         # caption_embeddings: (batch_size, caption_embed_dim)
         # mask: (batch_size, num_patches)
-        
+
         batch_size, channels, frames, height, width = x.shape
         psize_h, psize_w = self.patch_size
         seq_len = frames * height // psize_h * width // psize_w
-        
+
         # Image processing
         x = self.patch_embed(x)  # (batch_size, num_patches, embed_dim)
+        print(f'patched {x.shape}')
         B, N, D = x.shape
 
-        # Calculate the number of spatial patches per frame
-        num_spatial_patches = N // frames
-        # Reshape to add temporal embeddings
-        x = x.reshape(batch_size, frames, num_spatial_patches, self.embed_dim)
-
-        # Add fixed temporal embeddings
-        x = x + self.temporal_embed
-
-        # Flatten back
-        x = x.reshape(batch_size, N, self.embed_dim)
-
         # Generate positional embeddings
-        # (height // patch_size_h, width // patch_size_w, embed_dim)
-        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, height // psize_h, width // psize_w)
+        pos_embed = get_3d_sincos_pos_embed(self.embed_dim, frames, height // psize_h, width // psize_w)
+
         pos_embed = pos_embed.to(x.device).unsqueeze(0).expand(batch_size, -1, -1)
-        
+        print(f'{x.shape = } ,{pos_embed.shape = }')
+
         x = x + pos_embed
-        
+
         # Timestep embedding
         t_emb = self.time_embed(t)  # (batch_size, embed_dim)
 
         # Caption embedding
         c_emb = self.caption_embed(caption_embeddings)  # (batch_size, embed_dim)
+        print(f'c_emb {c_emb.shape}, t_emb {t_emb.shape}')
 
-        mha_out = self.mha(t_emb.unsqueeze(1), c_emb.unsqueeze(1), c_emb.unsqueeze(1))[0].squeeze(1)
+        mha_out = self.mha(t_emb.unsqueeze(1), c_emb, c_emb)[0].squeeze(1)
         mlp_out = self.mlp(mha_out)
         # Pool + MLP
+        print(f'mlp_out {mlp_out.shape}')
+
         pool_out = self.pool_mlp(mlp_out.unsqueeze(2))
 
         # Pool + MLP + t_emb
         pool_out = (pool_out + t_emb).unsqueeze(1)
-        
+        print(f'pool out {pool_out.shape}')
+
         # Apply linear layer
         cond_signal = self.linear(mlp_out).unsqueeze(1)  # (batch_size, 1, embed_dim)
         cond = (cond_signal + pool_out).expand(-1, x.shape[1], -1)
-        
+
+        print(f'cond {cond.shape} / cond_signal {cond_signal.shape}')
+
         # Add conditioning signal to all patches
         # (batch_size, num_patches, embed_dim)
         x = x + cond
@@ -1197,15 +1160,19 @@ class MicroViDiT(nn.Module):
         # Remove masked patches
         if mask is not None:
             x = remove_masked_patches(x, mask)
+        print(f'x masked {x.shape}')
 
         # MHA + MLP + Pool + MLP + t_emb
+        print(f'mlp out {mlp_out.unsqueeze(1).shape} / pool {pool_out.shape}')
+
         cond = (mlp_out.unsqueeze(1) + pool_out).expand(-1, x.shape[1], -1)
+        print(f'{cond.shape = }')
 
         x = x + cond
 
         # Backbone transformer model
-        x = self.backbone(x, c_emb)
-        
+        x = self.backbone(x, cond)
+        print(f'backbone out {x.shape}')
         # Final output layer
         # (bs, unmasked_num_patches, embed_dim) -> (bs, unmasked_num_patches, patch_size_h * patch_size_w * in_channels)
         x = self.output(x)
@@ -1215,26 +1182,30 @@ class MicroViDiT(nn.Module):
             # (bs, unmasked_num_patches, patch_size_h * patch_size_w * in_channels) -> (bs, num_patches, patch_size_h * patch_size_w * in_channels)
             x = add_masked_patches(x, mask)
 
+        print(f'unmasked {x.shape}')
+
         x = rearrange(
             x,
             "B (T hp wp) (p1 p2 c) -> B c T (hp p1) (wp p2)",
             T=frames,
-            hp=height // self.patch_size,
-            wp=width // self.patch_size,
-            p1=self.patch_size,
-            p2=self.patch_size,
+            hp=height // self.patch_size[0],
+            wp=width // self.patch_size[1],
+            p1=self.patch_size[0],
+            p2=self.patch_size[1],
             c=self.out_channels
         )
-        
+
+        print(f'vtheta => {x.shape}')
+
         return x
-    
+
     @torch.no_grad()
     def sample(self, z, cond, sample_steps=50, cfg=2.0):
         b = z.size(0)
         dt = 1.0 / sample_steps
         dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
         latents = [z]
-        
+
         for i in range(sample_steps, 0, -1):
             t = i / sample_steps
             t = torch.tensor([t] * b).to(z.device).to(torch.float16)
@@ -1246,8 +1217,9 @@ class MicroViDiT(nn.Module):
 
             z = z - dt * vc
             latents.append(z)
-            
+
         return latents[-1]
+
 
 
 def batch_trainer(
