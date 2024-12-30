@@ -4,49 +4,46 @@ import numpy as np
 import math, click
 from einops import rearrange
 from accelerate import Accelerator
-from diffusers import AutoencoderKLLTXVideo
 from collections import defaultdict
 from timm.models.vision_transformer import Attention, Mlp
 from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
-from moviepy.video.io import ImageSequenceClip
 from tqdm import tqdm
+from moviepy.video.io import ImageSequenceClip
 import torchvision, imageio
 import os, wandb, gc
 import torch.nn.functional as F
-import collections.abc
 import math
-from itertools import repeat
-from typing import Callable, Optional
+from typing import Optional
 
-ltx_vae = AutoencoderKLLTXVideo.from_pretrained(
-    "Lightricks/LTX-Video", subfolder="vae", torch_dtype=torch.bfloat16
-).to(device)
-ltx_vae.enable_tiling()
-ltx_vae.eval()
+from diffusers import AutoencoderKLHunyuanVideo
+
+vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="vae", torch_dtype=torch.bfloat16).to('cuda').eval()
+vae.enable_slicing()
 print('loaded video VAE')
 
 
 data_id = "tensorkelechi/tiny_webvid_latents"
-BS = 128
-EPOCHS = 30
 MASK_RATIO = 0.75
 SEED = 333
 LR = 1e-4
 scale_factor = 0.18215
-VAE_CHANNELS = 256
+VAE_CHANNELS = 16
+
 
 class config:
-    patch_size = (1, 1)
-    l_frames = 3
-    l_channels = 256
-    l_height = 7
-    l_width = 7
+    patch_size = (2, 2)
+    l_frames = 5
+    l_channels = 16
+    l_height = 28
+    l_width = 28
     lr = 1e-4
+    
 
 def seed_all(seed=SEED):
     np.random.seed(seed)
     torch.manual_seed(seed)
+    
 seed_all()
 
 
@@ -66,12 +63,13 @@ class Text2VideoDataset(IterableDataset):
 
     def __iter__(self):
         for sample in self.dataset:
-            latents = sample["video_latents"]  # type: ignore
+            latents = torch.tensor(sample["hyv_latents"], dtype=torch.bfloat16)  # type: ignore
 
-            caption = sample["text_encoded"]  # type: ignore
+            caption = torch.tensor(sample["text_encoded"], dtype=torch.bfloat16)  # type: ignore
+            caption = caption[:, :10, :]
+            # print(f'data shape = {latents.shape} / {caption.shape}')
 
             yield latents, caption
-
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
