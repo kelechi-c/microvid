@@ -1385,57 +1385,69 @@ def sample_video(step, model, captions):
     return gridfile
 
 
+def collate(batch):
+    # print(batch[1][1].shape)
+    latents = torch.stack([item[0] for item in batch], dim=0)
+    # print(f'{latents.shape = }')
+    text = [item[1][0] for item in batch]
+    labels = torch.stack(text, dim=0)
+
+    return {
+        "video_latents": latents,
+        "text_encoded": labels
+    }
+
 @click.command()
 @click.option("-r", "--run", default="single_batch")
 @click.option("-e", "--epochs", default=10)
 @click.option("-bs", "--batch_size", default=32)
 def main(run, epochs, batch_size):
-    embed_dim = 768
-    depth = 8
-    
+    embed_dim = 384
+    depth = 2
+
     accelerator = Accelerator(mixed_precision='bf16')
     device = accelerator.device
-    
+
     # DiT-B config
     microdit = MicroViDiT(
         in_channels=256,
-        patch_size = (2, 2),
+        patch_size = (1, 1),
         embed_dim=embed_dim,
         num_layers=depth,
-        num_heads=12,
-        mlp_dim=2*embed_dim,
-        caption_embed_dim=embed_dim,
-        num_experts=4, active_experts=2,
-        dropout=0.0, patch_mixer_layers=4
+        num_heads=8,
+        mlp_dim=embed_dim,
+        caption_embed_dim=768,
+        num_experts=8, active_experts=2,
+        dropout=0.0, patch_mixer_layers=2
     ).to(device)
 
     n_params = sum(p.numel() for p in microdit.parameters())
     print(f"model parameters count: {n_params/1e6:.2f}M, ")
 
-    dataset = Text2VideoDataset() 
+    dataset = Text2VideoDataset()
     t2v_train_loader = DataLoader(
         dataset,
-        batch_size=batch_size,
         num_workers=0,
+        batch_size=batch_size,
         drop_last=True,
-        # collate_fn=jax_collate,
+        collate_fn=collate
     )
 
-    optimizer = torch.optim.AdamW(microdit.parameters(), lr=LR)
+    optimizer = torch.optim.AdamW(microdit.parameters(), lr=1e-3)
 
     sp = next(iter(t2v_train_loader))
-    print(f"loaded data \n data sample: latents - {sp[0].shape}, text cond - {sp[1].shape}")
+    print(f"loaded data \n data sample: latents - {sp['video_latents'].shape}, text cond - {sp['text_encoded'].shape}")
 
     microdit, optimizer, t2v_train_loader = accelerator.prepare(microdit, optimizer, t2v_train_loader)
 
     if run == "single_batch":
-        model, loss = batch_trainer(
-            epochs=epochs, model=microdit, 
+        loss = batch_trainer(
+            epochs=epochs, model=microdit,
             optimizer=optimizer, train_loader=t2v_train_loader,
             accelerator=accelerator
         ) # type: ignore
-        
-        wandb.finish()
+
+        # wandb.finish()
         print(f"single batch training ended at loss: {loss:.4f}")
 
     elif run == "train":
