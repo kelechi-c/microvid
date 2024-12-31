@@ -1,5 +1,3 @@
-
-
 import torch
 import torch.nn as nn
 import numpy as np
@@ -619,7 +617,6 @@ class DiTBlock(nn.Module):
         return x
 
 
-
 class TransformerBackbone(nn.Module):
     def __init__(
         self,
@@ -798,12 +795,17 @@ class MicroViDiT(nn.Module):
 
     def __init__(
         self,
-        in_channels, patch_size: tuple,
-        embed_dim, num_layers,
-        num_heads, mlp_dim,
+        in_channels,
+        patch_size: tuple,
+        embed_dim,
+        num_layers,
+        num_heads,
+        mlp_dim,
         caption_embed_dim,
-        num_experts=4, active_experts=2,
-        dropout=0.0, patch_mixer_layers=2
+        num_experts=4,
+        active_experts=2,
+        dropout=0.0,
+        patch_mixer_layers=4,
     ):
 
         super().__init__()
@@ -814,10 +816,8 @@ class MicroViDiT(nn.Module):
 
         # Image processing
         self.patch_embed = Patchify(
-            patch_size= patch_size[0],
-            in_chans = in_channels,
-            embed_dim = embed_dim
-          )
+            patch_size=patch_size[0], in_chans=in_channels, embed_dim=embed_dim
+        )
 
         # Timestep embedding
         self.time_embed = TimestepEmbedder(self.embed_dim)
@@ -826,7 +826,7 @@ class MicroViDiT(nn.Module):
         self.caption_embed = nn.Sequential(
             nn.Linear(caption_embed_dim, self.embed_dim),
             nn.GELU(),
-            nn.Linear(self.embed_dim, self.embed_dim)
+            nn.Linear(self.embed_dim, self.embed_dim),
         )
 
         # MHA for timestep and caption
@@ -836,7 +836,7 @@ class MicroViDiT(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(self.embed_dim, self.embed_dim),
             nn.GELU(),
-            nn.Linear(self.embed_dim, self.embed_dim)
+            nn.Linear(self.embed_dim, self.embed_dim),
         )
 
         # Pool + MLP for (MHA + MLP)
@@ -845,7 +845,7 @@ class MicroViDiT(nn.Module):
             nn.Flatten(),
             nn.Linear(self.embed_dim, self.embed_dim),
             nn.GELU(),
-            nn.Linear(self.embed_dim, self.embed_dim)
+            nn.Linear(self.embed_dim, self.embed_dim),
         )
 
         # Linear layer after MHA+MLP
@@ -855,19 +855,28 @@ class MicroViDiT(nn.Module):
         self.patch_mixer = PatchMixer(self.embed_dim, num_heads, patch_mixer_layers)
 
         # Backbone transformer model
-        self.backbone = TransformerBackbone(self.embed_dim, self.embed_dim, self.embed_dim, num_layers, num_heads, mlp_dim,
-                                        num_experts, active_experts, dropout)
+        self.backbone = TransformerBackbone(
+            self.embed_dim,
+            self.embed_dim,
+            self.embed_dim,
+            num_layers,
+            num_heads,
+            mlp_dim,
+            num_experts,
+            active_experts,
+            dropout,
+        )
 
         # Output layer
         self.output = nn.Sequential(
             nn.Linear(self.embed_dim, self.embed_dim),
             nn.GELU(),
-            nn.Linear(self.embed_dim, patch_size[0] * patch_size[1] * in_channels)
+            nn.Linear(self.embed_dim, patch_size[0] * patch_size[1] * in_channels),
         )
 
         # Fixed temporal embedding layer
-        self.temporal_embed = nn.Parameter(torch.zeros(1, 3, embed_dim))
-        nn.init.normal_(self.temporal_embed)  # Initialize temporal embeddings
+        # self.temporal_embed = nn.Parameter(torch.zeros(1, 3, embed_dim))
+        # nn.init.normal_(self.temporal_embed)  # Initialize temporal embeddings
 
         self.initialize_weights()
 
@@ -1042,7 +1051,7 @@ class MicroViDiT(nn.Module):
             # (bs, unmasked_num_patches, patch_size_h * patch_size_w * in_channels) -> (bs, num_patches, patch_size_h * patch_size_w * in_channels)
             x = add_masked_patches(x, mask)
 
-        # unpatchify 
+        # unpatchify
         x = rearrange(
             x,
             "B (T hp wp) (p1 p2 c) -> B c T (hp p1) (wp p2)",
@@ -1134,72 +1143,6 @@ def batch_trainer(
             
     return losses[-1]
 
-def decode_video_tensor_to_gif(video_tensor, output_path, fps=30, grid_size=None):
-    """
-    Decodes a video tensor batch back into a video grid and saves it as a GIF.
-
-    Args:
-        video_tensor (torch.Tensor): A tensor of shape (B, C, T, H, W) representing a batch of videos.
-            - B: Batch size (number of videos)
-            - C: Number of channels (e.g., 3 for RGB)
-            - T: Number of frames
-            - H: Height of the frame
-            - W: Width of the frame
-        output_path (str): Path to the output GIF file.
-        fps (int, optional): Frames per second for the output GIF. Defaults to 30.
-        grid_size (tuple[int, int], optional): Tuple of (rows, cols) for creating a grid of videos, default is None,
-                                                which will use a horizontal grid of all videos in batch.
-    """
-
-    if not isinstance(video_tensor, torch.Tensor):
-        raise TypeError("Input video_tensor must be a torch.Tensor")
-
-    if video_tensor.ndim != 5:
-        raise ValueError(
-            f"Video tensor must have 5 dimensions (B, C, T, H, W), got {video_tensor.ndim}"
-        )
-
-    batch_size, channels, num_frames, height, width = video_tensor.shape
-
-    if grid_size is None:
-        grid_rows = 1
-        grid_cols = batch_size
-    else:
-        grid_rows, grid_cols = grid_size
-        if grid_rows * grid_cols != batch_size:
-            raise ValueError(
-                f"grid_size rows * cols {grid_rows * grid_cols} must match batch size {batch_size}"
-            )
-
-    frames_batch_list = []
-
-    for frame_idx in range(num_frames):
-        # create a grid of frames from each video
-        frames_batch = []
-        for row_idx in range(grid_rows):
-            frame_row = []
-            for col_idx in range(grid_cols):
-                video_idx = row_idx * grid_cols + col_idx
-                frame = video_tensor[video_idx, :, frame_idx, :, :]
-                frame = frame.permute(1, 2, 0).cpu().numpy()
-                frame = (frame * 255).astype(
-                    np.uint8
-                )  # Ensure frame is in [0, 255] range
-                if frame.shape[2] == 1:  # convert graycale to RGB
-                    frame = np.concatenate(
-                        [frame, frame, frame], axis=2
-                    )  # convert to RGB
-                frame_row.append(frame)
-            frame_row = np.concatenate(frame_row, axis=1)
-            frames_batch.append(frame_row)
-        frames_batch = np.concatenate(frames_batch, axis=0)
-
-        frames_batch_list.append(frames_batch)
-    # Save as GIF
-    imageio.mimsave(output_path, frames_batch_list, fps=fps)
-    
-    return output_path
-
 
 def wandb_logger(key: str, project_name, run_name=None):
     # initilaize wandb
@@ -1219,35 +1162,37 @@ def save_video(final_frames, output_path='sample.mp4', fps=4):
     
     return output_path
 
-def process_video_latents(latents, vae=ltx_vae):
-    latents = vae.tiled_decode(latents) / scale_factor
-    latents = rearrange(latents, 'b c t h w -> b t c h w')
+def process_video_latents(latents, vae=vae):
+    # latents = vae.decode(latents.to(torch.bfloat16))[0].sample()[0] / scale_factor
+    latents = vae.tiled_decode(latents.to(torch.bfloat16))[0] / scale_factor
 
+    print(f'tildecode {latents.shape}')
+    latents = rearrange(latents, 'b c t h w -> b t c h w')
+    print(f'decoded {latents.shape}')
     return latents
 
 def sample_video(step, model, captions):
     pred_model = model.eval()
-    image_batch = pred_model.sample(captions)
-    file = f"fmsamples/{step}_microvid.gif"
-    batch = [process_video_latents(x) for x in image_batch]
-
-    gridfile = decode_video_tensor_to_gif(batch, file)
-    print(f"sample saved @ {gridfile}")
+    noise = torch.randn(1, 16, 5, 28, 28).cuda().to(torch.bfloat16)
+    vidlatent = pred_model.sample(noise, captions[None])
+    vidfile = f"vidsamples/vid_{step}_microvid.mp4"
+    
+    batch = process_video_latents(vidlatent)
+    vidfile = save_video(batch[0])
+    print(f"sample vid saved @ {vidfile}")
     del pred_model
 
-    return gridfile
+    return vidfile
 
 
 def collate(batch):
-    # print(batch[1][1].shape)
     latents = torch.stack([item[0] for item in batch], dim=0)
-    # print(f'{latents.shape = }')
     text = [item[1][0] for item in batch]
     labels = torch.stack(text, dim=0)
 
     return {
         "video_latents": latents,
-        "text_encoded": labels
+        "text_encoded": labels,
     }
 
 @click.command()
