@@ -613,43 +613,12 @@ class DiTBlock(nn.Module):
         x = x + gate_msa * self.attn(
             t2i_modulate(self.norm1(x), shift_msa, scale_msa)
         )
-        print(x.shape)
         x = x + gate_mlp * self.moe(
             t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)
         )
-        print(f'block shape {x.shape}')
         return x
 
 
-class FinalLayer(nn.Module):
-    """
-    The final layer of DiT.
-    """
-
-    def __init__(self, hidden_size, patch_size, out_channels):
-        super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(
-            hidden_size, patch_size * patch_size * out_channels, bias=True
-        )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
-
-    def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
-        x = t2i_modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-        return x
-
-
-def nearest_divisor(scaled_num_heads, embed_dim):
-    # Find all divisors of embed_dim
-    divisors = [i for i in range(1, embed_dim + 1) if embed_dim % i == 0]
-    # Find the nearest divisor
-    nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
-    
-    return nearest
 
 class TransformerBackbone(nn.Module):
     def __init__(
@@ -681,7 +650,7 @@ class TransformerBackbone(nn.Module):
             # Scale the dimensions according to the scaling factors
             scaled_mlp_dim = int(mlp_dim * mf)
             scaled_num_heads = max(1, int(num_heads * ma))
-            scaled_num_heads = nearest_divisor(scaled_num_heads, embed_dim)
+            scaled_num_heads = self.nearest_divisor(scaled_num_heads, embed_dim)
             mlp_ratio = int(scaled_mlp_dim / embed_dim)
 
             # Choose layer type based on the layer index (even/odd)
@@ -705,6 +674,15 @@ class TransformerBackbone(nn.Module):
 
         self.output_layer = nn.Linear(embed_dim, input_dim)
 
+    def nearest_divisor(self, scaled_num_heads, embed_dim):
+        # Find all divisors of embed_dim
+        divisors = [i for i in range(1, embed_dim + 1) if embed_dim % i == 0]
+        # Find the nearest divisor
+        nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
+        
+        return nearest
+    
+    
     def initialize_weights(self):
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -764,6 +742,7 @@ class TransformerBackbone(nn.Module):
         for layer in self.layers:
             if isinstance(layer, DiTBlock):
                 layer.initialize_weights()
+
 
     def forward(self, x, c_emb):
         x = self.input_embedding(x)
@@ -998,7 +977,7 @@ class MicroViDiT(nn.Module):
     def forward(self, x, t, caption_embeddings, mask=None):
         # x: (batch_size, in_channels, height, width)
         # t: (batch_size, 1)
-        # caption_embeddings: (batch_size, caption_embed_dim)
+        # caption_embeddings: (batch_size, seq_len, caption_embed_dim)
         # mask: (batch_size, num_patches)
 
         batch_size, channels, frames, height, width = x.shape
@@ -1007,14 +986,10 @@ class MicroViDiT(nn.Module):
 
         # Image processing
         x = self.patch_embed(x)  # (batch_size, num_patches, embed_dim)
-        print(f'patched {x.shape}')
-        B, N, D = x.shape
 
         # Generate positional embeddings
         pos_embed = get_3d_sincos_pos_embed(self.embed_dim, frames, height // psize_h, width // psize_w)
-
         pos_embed = pos_embed.to(x.device).unsqueeze(0).expand(batch_size, -1, -1)
-        print(f'{x.shape = } ,{pos_embed.shape = }')
 
         x = x + pos_embed
 
@@ -1034,29 +1009,23 @@ class MicroViDiT(nn.Module):
 
         # Pool + MLP + t_emb
         pool_out = (pool_out + t_emb).unsqueeze(1)
-        print(f'pool out {pool_out.shape}')
 
         # Apply linear layer
         cond_signal = self.linear(mlp_out).unsqueeze(1)  # (batch_size, 1, embed_dim)
         cond = (cond_signal + pool_out).expand(-1, x.shape[1], -1)
 
-        print(f'cond {cond.shape} / cond_signal {cond_signal.shape}')
-
         # Add conditioning signal to all patches
         # (batch_size, num_patches, embed_dim)
         x = x + cond
 
-        # Patch-mixer
+        # Patch-mixer step
         x = self.patch_mixer(x)
 
         # Remove masked patches
         if mask is not None:
             x = remove_masked_patches(x, mask)
-        print(f'x masked {x.shape}')
 
         # MHA + MLP + Pool + MLP + t_emb
-        print(f'mlp out {mlp_out.unsqueeze(1).shape} / pool {pool_out.shape}')
-
         cond = (mlp_out.unsqueeze(1) + pool_out).expand(-1, x.shape[1], -1)
         print(f'{cond.shape = }')
 
@@ -1064,7 +1033,6 @@ class MicroViDiT(nn.Module):
 
         # Backbone transformer model
         x = self.backbone(x, cond)
-        print(f'backbone out {x.shape}')
         # Final output layer
         # (bs, unmasked_num_patches, embed_dim) -> (bs, unmasked_num_patches, patch_size_h * patch_size_w * in_channels)
         x = self.output(x)
@@ -1074,8 +1042,7 @@ class MicroViDiT(nn.Module):
             # (bs, unmasked_num_patches, patch_size_h * patch_size_w * in_channels) -> (bs, num_patches, patch_size_h * patch_size_w * in_channels)
             x = add_masked_patches(x, mask)
 
-        print(f'unmasked {x.shape}')
-
+        # unpatchify 
         x = rearrange(
             x,
             "B (T hp wp) (p1 p2 c) -> B c T (hp p1) (wp p2)",
@@ -1086,8 +1053,6 @@ class MicroViDiT(nn.Module):
             p2=self.patch_size[1],
             c=self.out_channels
         )
-
-        print(f'vtheta => {x.shape}')
 
         return x
 
@@ -1100,7 +1065,7 @@ class MicroViDiT(nn.Module):
 
         for i in range(sample_steps, 0, -1):
             t = i / sample_steps
-            t = torch.tensor([t] * b).to(z.device).to(torch.float16)
+            t = torch.tensor([t] * b).to(z.device).to(torch.bfloat16)
 
             vc = self(z, t, cond, None)
             null_cond = torch.zeros_like(cond)
