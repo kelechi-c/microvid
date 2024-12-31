@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import math
 from typing import Optional
 
+from diffusers.utils.export_utils import export_to_video
 from diffusers import AutoencoderKLHunyuanVideo
 
 vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="vae", torch_dtype=torch.bfloat16).to('cuda').eval()
@@ -76,7 +77,8 @@ class Text2VideoDataset(IterableDataset):
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-def t2i_modulate(x, shift, scale):
+# the text sequence from t5 is 2D already, so no need to add a middle dimension
+def t2i_modulate(x, shift, scale): 
     return x * (1 + scale) + shift
 
 
@@ -299,31 +301,9 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class PooledCaptionEmbedder(nn.Module):
-    def __init__(
-        self,
-        caption_feature_dim: int,
-        hidden_size: int,
-        *,
-        bias: bool = True,
-        device: Optional[torch.device] = None,
-    ):
-        super().__init__()
-        self.caption_feature_dim = caption_feature_dim
-        self.hidden_size = hidden_size
-        self.mlp = nn.Sequential(
-            nn.Linear(caption_feature_dim, hidden_size, bias=bias, device=device),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=bias, device=device),
-        )
-
-    def forward(self, x):
-        return self.mlp(x)
-
-
 class MoEGate(nn.Module):
     def __init__(
-        self, embed_dim, num_experts=16, num_experts_per_tok=2, aux_loss_alpha=0.01
+        self, embed_dim, num_experts=8, num_experts_per_tok=2, aux_loss_alpha=0.01
     ):
         super().__init__()
         self.top_k = num_experts_per_tok
@@ -348,6 +328,7 @@ class MoEGate(nn.Module):
 
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape
+        # print(f'{hidden_states.shape = }')
         # print(bsz, seq_len, h)
         ### compute gating score
         hidden_states = hidden_states.view(-1, h)
@@ -421,7 +402,7 @@ class AddAuxiliaryLoss(torch.autograd.Function):
 
 
 class MoeMLP(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, pretraining_tp=2):
+    def __init__(self, hidden_size, intermediate_size, pretraining_tp=1):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -436,6 +417,8 @@ class MoeMLP(nn.Module):
         if self.pretraining_tp > 1:
             slice = self.intermediate_size // self.pretraining_tp
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
+            # print(len(gate_proj_slices))
+
             up_proj_slices = self.up_proj.weight.split(slice, dim=0)
             # print(self.up_proj.weight.size(), self.down_proj.weight.size())
             down_proj_slices = self.down_proj.weight.split(slice, dim=1)
@@ -472,9 +455,9 @@ class SparseMoeBlock(nn.Module):
         self,
         embed_dim,
         mlp_ratio=4,
-        num_experts=16,
+        num_experts=8,
         num_experts_per_tok=2,
-        pretraining_tp=2,
+        pretraining_tp=1,
     ):
         super().__init__()
         self.num_experts_per_tok = num_experts_per_tok
@@ -560,33 +543,6 @@ class SparseMoeBlock(nn.Module):
         return expert_cache
 
 
-class FeedForward(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        hidden_size: int,
-        multiple_of: int,
-        ffn_dim_multiplier: Optional[float],
-        device: Optional[torch.device] = None,
-    ):
-        super().__init__()
-        # keep parameter count and computation constant compared to standard FFN
-        hidden_size = int(2 * hidden_size / 3)
-        # custom dim factor multiplier
-        if ffn_dim_multiplier is not None:
-            hidden_size = int(ffn_dim_multiplier * hidden_size)
-        hidden_size = multiple_of * ((hidden_size + multiple_of - 1) // multiple_of)
-
-        self.hidden_dim = hidden_size
-        self.w1 = nn.Linear(in_features, 2 * hidden_size, bias=False, device=device)
-        self.w2 = nn.Linear(hidden_size, in_features, bias=False, device=device)
-
-    def forward(self, x: torch.Tensor):
-        # torch.chun
-        x, gate = self.w1(x).chunk(2, dim=-1)
-        x = self.w2(F.silu(x) * gate)
-        return x
-
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
@@ -600,7 +556,6 @@ class DiTBlock(nn.Module):
         num_experts=8,
         num_experts_per_tok=2,
         pretraining_tp=2,
-        use_flash_attn=False,
         **block_kwargs,
     ):
         super().__init__()
