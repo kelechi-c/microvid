@@ -1,16 +1,17 @@
+
+
 import torch
 import torch.nn as nn
 import numpy as np
 import math, click
 from einops import rearrange
 from accelerate import Accelerator
-from collections import defaultdict
-from timm.models.vision_transformer import Attention, Mlp
+from timm.models.vision_transformer import Attention
 from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
 from tqdm import tqdm
 from moviepy.video.io import ImageSequenceClip
-import torchvision, imageio
+import imageio
 import os, wandb, gc
 import torch.nn.functional as F
 import math
@@ -43,12 +44,13 @@ class config:
 def seed_all(seed=SEED):
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.random.manual_seed(seed)
 
 seed_all()
 
 
 class Text2VideoDataset(IterableDataset):
-    def __init__(self, split=512):
+    def __init__(self, split=64):
         super().__init__()
         self.split = split
         self.dataset = load_dataset(
@@ -56,7 +58,7 @@ class Text2VideoDataset(IterableDataset):
             streaming=True,
             split="train",
             trust_remote_code=True,
-        ).take(self.split)
+        ).take(self.split) # Haven't preprocessed enough videos yet
 
     def __len__(self):
         return self.split
@@ -170,20 +172,9 @@ def add_masked_patches(patches, mask):
 
     return full_patches
 
-
+## Note: for 3D Pos-embed, embed_dim/hidden size should be divisible by 6 (384, 768, 1152)
+# Generates 3D sinusoidal positional embeddings.
 def get_3d_sincos_pos_embed(embed_dim, t, h, w):
-    """
-    Generates 3D sinusoidal positional embeddings.
-
-    Args:
-        embed_dim (int): Embedding dimension.
-        t (int): Number of time steps (frames).
-        h (int): Height of the spatial grid.
-        w (int): Width of the spatial grid.
-
-    Returns:
-        torch.Tensor: Positional embeddings of shape (T*H*W, embed_dim).
-    """
     grid_t = torch.arange(t, dtype=torch.float32)
     grid_h = torch.arange(h, dtype=torch.float32)
     grid_w = torch.arange(w, dtype=torch.float32)
@@ -194,21 +185,28 @@ def get_3d_sincos_pos_embed(embed_dim, t, h, w):
     pos_embed = get_3d_sincos_pos_embed_from_grid(embed_dim, grid)
     return pos_embed
 
+
 def get_3d_sincos_pos_embed_from_grid(embed_dim, grid):
-    """
-    Generates 3D sinusoidal positional embeddings from a grid.
-
-    Args:
-        embed_dim (int): Embedding dimension.
-        grid (torch.Tensor): Grid coordinates of shape (3, T, H, W).
-
-    Returns:
-        torch.Tensor: Positional embeddings of shape (T*H*W, embed_dim).
-    """
+    
     assert embed_dim % 2 == 0
     emb_dim_per_axis = embed_dim // 3  # Divide embedding dimension across 3 axes
     assert emb_dim_per_axis % 2 == 0
 
+    def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+        assert embed_dim % 2 == 0
+        omega = torch.arange(embed_dim // 2, dtype=torch.float32)
+        omega /= embed_dim / 2.0
+        omega = 1.0 / (10000**omega)  # (D/2,)
+
+        pos = pos.reshape(-1)  # (M,)
+        out = torch.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
+
+        emb_sin = torch.sin(out)  # (M, D/2)
+        emb_cos = torch.cos(out)  # (M, D/2)
+
+        emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
+        return emb
+    
     emb_t = get_1d_sincos_pos_embed_from_grid(emb_dim_per_axis, grid[0])  # (T*H*W, D/3)
     emb_h = get_1d_sincos_pos_embed_from_grid(emb_dim_per_axis, grid[1])  # (T*H*W, D/3)
     emb_w = get_1d_sincos_pos_embed_from_grid(emb_dim_per_axis, grid[2])  # (T*H*W, D/3)
@@ -216,36 +214,12 @@ def get_3d_sincos_pos_embed_from_grid(embed_dim, grid):
     emb = torch.cat([emb_t, emb_h, emb_w], dim=1)  # (T*H*W, D)
     return emb
 
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    Generates 1D sinusoidal positional embeddings from grid positions.
 
-    Args:
-        embed_dim (int): Embedding dimension.
-        pos (torch.Tensor): 1D position coordinates.
-
-    Returns:
-        torch.Tensor: Positional embeddings of shape (M, embed_dim).
-    """
-    assert embed_dim % 2 == 0
-    omega = torch.arange(embed_dim // 2, dtype=torch.float32)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / (10000**omega)  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = torch.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
-
-    emb_sin = torch.sin(out)  # (M, D/2)
-    emb_cos = torch.cos(out)  # (M, D/2)
-
-    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
-    return emb
-
-
+# uses conv2d/spatiotemporal flattening, Strategy usd in Mochi. Will change if it doesn't work properly
 class Patchify(nn.Module):
     def __init__( 
         self,
-        patch_size: int = 1,
+        patch_size: int = 2,
         in_chans: int = 3,
         embed_dim: int = 768,
         norm_layer = None,
