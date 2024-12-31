@@ -38,12 +38,12 @@ class config:
     l_height = 28
     l_width = 28
     lr = 1e-4
-    
+
 
 def seed_all(seed=SEED):
     np.random.seed(seed)
     torch.manual_seed(seed)
-    
+
 seed_all()
 
 
@@ -74,9 +74,9 @@ class Text2VideoDataset(IterableDataset):
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-
 def t2i_modulate(x, shift, scale):
     return x * (1 + scale) + shift
+
 
 def apply_mask_to_tensor(x, mask, patch_size):
     bs, c, d, h, w = x.shape
@@ -106,47 +106,6 @@ def apply_mask_to_tensor(x, mask, patch_size):
     x = x * mask
 
     return x
-
-
-def unpatchify(x, patch_size, depth, height, width):
-
-    bs, num_patches, patch_dim = x.shape
-    D, H, W = patch_size
-    in_channels = patch_dim // (D * H * W)
-
-    # Calculate the number of patches along each dimension
-    num_patches_d = depth // D
-    num_patches_h = height // H
-    num_patches_w = width // W
-
-    # Ensure num_patches equals num_patches_d * num_patches_h * num_patches_w
-    assert (
-        num_patches == num_patches_d * num_patches_h * num_patches_w
-    ), "Mismatch in number of patches."
-
-    # Reshape x to (bs, num_patches_d, num_patches_h, num_patches_w, D, H, W, in_channels)
-    x = x.view(bs, num_patches_d, num_patches_h, num_patches_w, D, H, W, in_channels)
-
-    # Permute x to (bs, num_patches_d, D, num_patches_h, H, num_patches_w, W, in_channels)
-    x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous()
-
-    # Reshape x to (bs, depth, height, width, in_channels)
-    reconstructed = x.view(bs, depth, height, width, in_channels)
-
-    # Permute back to (bs, in_channels, depth, height, width)
-    reconstructed = reconstructed.permute(0, 4, 1, 2, 3).contiguous()
-
-    return reconstructed
-
-
-def strings_to_tensor(string_list):
-    # Convert each string to a list using eval
-    list_of_lists = [eval(s) for s in string_list]
-
-    # Convert the list of lists to a PyTorch tensor
-    tensor = torch.tensor(list_of_lists, dtype=torch.float32)
-
-    return tensor
 
 
 def random_mask(
@@ -195,16 +154,19 @@ def add_masked_patches(patches, mask):
     bs, num_patches = mask.shape
     embed_dim = patches.shape[-1]
 
-    # Create a tensor of zeros with the same shape and dtype as the patches tensor
+    # Create a tensor of zeros with the same shape and dtype as the intended output
     full_patches = torch.zeros(
         bs, num_patches, embed_dim, device=patches.device, dtype=patches.dtype
     )
 
-    # Create a mask for where patches should be placed
+    # Identify the indices where the mask is True (unmasked patches)
     mask_indices = mask.nonzero(as_tuple=True)
 
-    # Assign the unmasked patches back to their original positions
-    full_patches[mask_indices[0], mask_indices[1]] = patches
+    # Check if the number of unmasked patches matches the patches tensor size
+    num_unmasked = patches.shape[1]
+
+    # Assign the processed patches back to their unmasked positions
+    full_patches[mask_indices[0], mask_indices[1]] = patches.reshape(-1, embed_dim)
 
     return full_patches
 
@@ -750,7 +712,7 @@ class FinalLayer(nn.Module):
         x = t2i_modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
-    
+
 
 def nearest_divisor(scaled_num_heads, embed_dim):
     # Find all divisors of embed_dim
@@ -1220,7 +1182,6 @@ class MicroViDiT(nn.Module):
             latents.append(z)
 
         return latents[-1]
-
 
 
 def batch_trainer(
