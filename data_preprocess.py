@@ -6,23 +6,27 @@ from torchvision import transforms
 from typing import Tuple
 from datasets import load_dataset
 from transformers import AutoTokenizer, T5EncoderModel
-from diffusers import AutoencoderKLLTXVideo
+from diffusers import AutoencoderKLHunyuanVideo
 from huggingface_hub import login
 
 login("")
 
 t5_id = "google-t5/t5-base"
-vae_id = "genmo/mochi-1-preview"
 source_data_id = "Doubiiu/webvid10m_motion"
 smol_data = "tensorkelechi/tinyvirat"
 latents_id = "tensorkelechi/tiny_webvid_latents"
 split_size = 1024
 
-ltx_vae = AutoencoderKLLTXVideo.from_pretrained(
-    "Lightricks/LTX-Video", subfolder="vae", torch_dtype=torch.bfloat16
-).to("cuda")
-ltx_vae.enable_tiling()
-ltx_vae.eval()
+vae = (
+    AutoencoderKLHunyuanVideo.from_pretrained(
+        "hunyuanvideo-community/HunyuanVideo",
+        subfolder="vae",
+        torch_dtype=torch.bfloat16,
+    )
+    .to("cuda")
+    .eval()
+)
+
 
 t5_tokenizer = AutoTokenizer.from_pretrained(t5_id)  # .to('cuda')
 t5_model = T5EncoderModel.from_pretrained(t5_id).to("cuda")
@@ -186,7 +190,7 @@ class VideoProcessor:
         gc.collect()
 
         batch = vid2tensor(batch)
-
+ 
         return batch
 
 
@@ -197,12 +201,11 @@ processor = VideoProcessor(
 
 def encode_video(batch):
     with torch.no_grad():
-        video_tensor = (
-            torch.tensor(batch["video_tensor"])[None].cuda().to(torch.bfloat16)
-        )
-        latents = ltx_vae.tiled_encode(video_tensor)[0]
-        batch["video_latents"] = latents  # .sample()
-        batch["latent_shape"] = batch["video_latents"].shape
+        video_tensor = torch.tensor(batch["video_tensor"])[None].to(torch.bfloat16)
+
+        latents = vae.encode(video_tensor.to("cuda"))[0]
+        batch["hyv_latents"] = latents.sample()[0]
+        batch["hyv_latent_shape"] = batch["hyv_latents"].shape
         del latents
         torch.cuda.empty_cache()
         gc.collect()
