@@ -1,3 +1,10 @@
+'''
+single file [model/data/trainer] for  
+microvid - video generation with modified microdiffusion architecture
+
+This is totally experimental please.
+'''
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -9,7 +16,6 @@ from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
 from tqdm import tqdm
 from moviepy.video.io import ImageSequenceClip
-import imageio
 import os, wandb, gc
 import torch.nn.functional as F
 import math
@@ -1087,63 +1093,6 @@ class MicroViDiT(nn.Module):
         return latents[-1]
 
 
-def batch_trainer(
-    epochs,
-    model,
-    optimizer,
-    train_loader,
-    accelerator
-):
-    batch = next(iter(train_loader))
-    patch_size = config.patch_size
-    device = accelerator.device
-    losses = []
-    
-    # wandb_logger(key='', project_name='microvid')
-    
-    print('start single batch training..../ \n')
-
-    for epoch in tqdm(range(epochs), desc='Training...'):
-        # progress_bar = tqdm(dataset, desc=f"Epoch {epoch}", leave=False)
-    # for batch_idx, batch in enumerate(dataset):
-        optimizer.zero_grad()
-        
-        latents = batch["vae_latent"][0].to(device)
-        caption_embeddings = batch["text_embedding"][0].to(device)
-        # print(f'{latents.shape = } / {caption_embeddings.shape = }')
-        bs, c, d, h, w = latents.shape
-        # latents = latents * VAE_SCALING_FACTOR
-
-        mask = random_mask(bs, d, h, w, patch_size=patch_size, mask_ratio=MASK_RATIO).to(device)
-
-        nt = torch.randn((bs,)).to(device)
-        t = torch.sigmoid(nt)
-        
-        texp = t.view([bs, *([1] * len(latents.shape[1:]))]).to(device)
-        z1 = torch.randn_like(latents, device=device)
-        zt = (1 - texp) * latents + texp * z1
-        
-        vtheta = model(zt, t, caption_embeddings, mask)
-
-        latents = apply_mask_to_tensor(latents, mask, patch_size)
-        vtheta = apply_mask_to_tensor(vtheta, mask, patch_size)
-        z1 = apply_mask_to_tensor(z1, mask, patch_size)
-
-        batchwise_mse = ((z1 - latents - vtheta) ** 2).mean(dim=list(range(1, len(latents.shape))))
-        loss = batchwise_mse.mean()
-        loss = loss * 1 / (1 - MASK_RATIO)
-        print(f'epoch {epoch}, loss => {loss.item():.4f}')
-        wandb.log({'loss/train': loss.item(), "log_loss/train": math.log10(loss.item())})
-        
-        accelerator.backward(loss)
-        optimizer.step()
-
-        if accelerator.is_local_main_process:
-            losses.append(loss.item())
-            
-    return losses[-1]
-
-
 def wandb_logger(key: str, project_name, run_name=None):
     # initilaize wandb
     wandb.login(key=key)
@@ -1185,6 +1134,70 @@ def sample_video(step, model, captions):
     return vidfile
 
 
+def batch_trainer(
+    epochs,
+    model,
+    optimizer,
+    train_loader,
+    accelerator
+):
+    batch = next(iter(train_loader))
+    patch_size = (2, 2, 2)
+    device = accelerator.device
+    losses = []
+
+    # wandb_logger(key='', project_name='microvid')
+
+    print('start single batch training..../ \n')
+
+    for epoch in tqdm(range(epochs), desc='Training...'):
+        # progress_bar = tqdm(dataset, desc=f"Epoch {epoch}", leave=False)
+    # for batch_idx, batch in enumerate(dataset):
+        optimizer.zero_grad()
+
+        latents = batch["video_latents"].to(device)
+        caption_embeddings = batch["text_encoded"].to(device)
+        bs, c, d, h, w = latents.shape
+        latents = latents * scale_factor
+
+        mask = random_mask(bs, d, h, w, patch_size=patch_size, mask_ratio=MASK_RATIO).to(device)
+        # print(f'{mask.shape = }')
+
+        nt = torch.randn((bs,)).to(device)
+        t = torch.sigmoid(nt)
+
+        texp = t.view([bs, *([1] * len(latents.shape[1:]))]).to(device)
+        z1 = torch.randn_like(latents, device=device)
+
+        zt = (1 - texp) * latents + texp * z1
+
+        vtheta = model(zt, t, caption_embeddings, mask)
+
+        latents = apply_mask_to_tensor(latents, mask, patch_size)
+        vtheta = apply_mask_to_tensor(vtheta, mask, patch_size)
+        z1 = apply_mask_to_tensor(z1, mask, patch_size)
+
+        batchwise_mse = ((z1 - latents - vtheta) ** 2).mean(dim=list(range(1, len(latents.shape))))
+        loss = batchwise_mse.mean()
+        loss = loss * 1 / (1 - MASK_RATIO)
+        print(f'epoch {epoch}, loss => {loss.item():.4f}')
+        
+        # wandb.log({'loss/train': loss.item(), "log_loss/train": math.log10(loss.item())})
+
+        accelerator.backward(loss)
+        optimizer.step()
+
+        if accelerator.is_local_main_process:
+            losses.append(loss.item())
+
+        # if epoch % 10 == 0:
+        #     vidfile = sample_video(epoch, model, batch["text_encoded"][0].cuda())
+        #     vidlog = wandb.Video(vidfile, fps=4)
+        #     #wandb.log({'vidsample': vidlog})
+
+    return losses[-1]
+
+
 def collate(batch):
     latents = torch.stack([item[0] for item in batch], dim=0)
     text = [item[1][0] for item in batch]
@@ -1200,22 +1213,22 @@ def collate(batch):
 @click.option("-e", "--epochs", default=10)
 @click.option("-bs", "--batch_size", default=32)
 def main(run, epochs, batch_size):
-    embed_dim = 384
-    depth = 2
+    embed_dim = 768
+    depth = 12
 
     accelerator = Accelerator(mixed_precision='bf16')
     device = accelerator.device
 
     # DiT-B config
     microdit = MicroViDiT(
-        in_channels=256,
-        patch_size = (1, 1),
+        in_channels=16,
+        patch_size = (2, 2),
         embed_dim=embed_dim,
         num_layers=depth,
         num_heads=8,
         mlp_dim=embed_dim,
         caption_embed_dim=768,
-        num_experts=8, active_experts=2,
+        num_experts=4, active_experts=2,
         dropout=0.0, patch_mixer_layers=2
     ).to(device)
 
@@ -1245,7 +1258,7 @@ def main(run, epochs, batch_size):
             accelerator=accelerator
         ) # type: ignore
 
-        # wandb.finish()
+        wandb.finish()
         print(f"single batch training ended at loss: {loss:.4f}")
 
     elif run == "train":
